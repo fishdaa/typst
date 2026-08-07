@@ -24,7 +24,7 @@ use typst_utils::Scalar;
 
 use crate::args::{
     CompileArgs, CompileCommand, DepsFormat, DiagnosticFormat, Input, Output,
-    OutputFormat, PdfStandard, WatchCommand,
+    OutputFormat, PdfStandard, PngCompression, WatchCommand,
 };
 use crate::deps::write_deps;
 use crate::watch::Status;
@@ -80,6 +80,8 @@ pub struct CompileConfig {
     pub deps_format: DepsFormat,
     /// The PPI (pixels per inch) to use for PNG export.
     pub ppi: f64,
+    /// The compression effort to use for PNG export.
+    pub png_compression: PngCompression,
     /// The export cache for images, used for caching output files in `typst
     /// watch` sessions with images.
     pub export_cache: ExportCache,
@@ -240,6 +242,7 @@ impl CompileConfig {
                 })
                 .transpose()?,
             ppi: args.ppi,
+            png_compression: args.png_compression,
             diagnostic_format: args.process.diagnostic_format,
             open: args.open.clone(),
             export_cache: ExportCache::new(),
@@ -573,8 +576,7 @@ fn export_image_page(
         ImageExportFormat::Png => {
             let options = png_options(config);
             let pixmap = typst_render::render(page, &options);
-            let buf = pixmap
-                .encode_png()
+            let buf = encode_png(pixmap, config.png_compression)
                 .map_err(|err| eco_format!("failed to encode PNG file ({err})"))?;
             output
                 .write(&buf)
@@ -589,6 +591,35 @@ fn export_image_page(
         }
     }
     Ok(())
+}
+
+/// Encodes a rendered page as a PNG, honoring the configured compression
+/// effort.
+///
+/// This reimplements `tiny_skia::Pixmap::encode_png` instead of calling it
+/// directly for two reasons: that method hardcodes the `png` crate's default
+/// compression (`Balanced`, slow for very large pages), and it takes `&self`,
+/// forcing an extra full-buffer clone before demultiplying alpha. Consuming
+/// `pixmap` by value here avoids that clone.
+fn encode_png(
+    pixmap: tiny_skia::Pixmap,
+    compression: PngCompression,
+) -> Result<Vec<u8>, png::EncodingError> {
+    let width = pixmap.width();
+    let height = pixmap.height();
+    let demultiplied_data = pixmap.take_demultiplied();
+
+    let mut data = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut data, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(compression.into());
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&demultiplied_data)?;
+    }
+
+    Ok(data)
 }
 
 /// Creates options for HTML export.

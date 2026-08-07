@@ -41,6 +41,8 @@ fs_extra = { workspace = true }
 open = { workspace = true }
 parking_lot = { workspace = true }
 pathdiff = { workspace = true }
+png = { workspace = true }
+tiny-skia = { workspace = true }
 rayon = { workspace = true }
 self-replace = { workspace = true, optional = true }
 semver = { workspace = true }
@@ -81,6 +83,7 @@ clap = { workspace = true, features = ["string"] }
 clap_complete = { workspace = true }
 clap_mangen = { workspace = true }
 color-print = { workspace = true }
+png = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 typst-utils = { workspace = true }

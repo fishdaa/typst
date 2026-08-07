@@ -356,6 +356,12 @@ pub struct CompileArgs {
     #[arg(long = "ppi", default_value_t = 144.0)]
     pub ppi: f64,
 
+    /// The compression effort to use for PNG export. Lower effort trades a
+    /// larger file for faster encoding, which matters most for large pages
+    /// (e.g. big posters) where PNG encoding time can dominate.
+    #[arg(long = "png-compression", default_value_t)]
+    pub png_compression: PngCompression,
+
     /// File path to which a Makefile with the current compilation's
     /// dependencies will be written.
     #[clap(long = "make-deps", value_name = "PATH", hide = true)]
@@ -642,6 +648,37 @@ pub enum DiagnosticFormat {
 }
 
 display_possible_values!(DiagnosticFormat);
+
+/// The compression effort to use when encoding a PNG.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, ValueEnum)]
+pub enum PngCompression {
+    /// No compression whatsoever. Fastest, but results in large files.
+    NoCompression,
+    /// Extremely fast but light compression.
+    Fastest,
+    /// Extremely fast compression with a decent compression ratio. Best
+    /// choice for very large pages where encoding time matters most.
+    #[default]
+    Fast,
+    /// Balances encoding speed and compression ratio.
+    Balanced,
+    /// Spend much more time to produce a slightly smaller file.
+    High,
+}
+
+impl From<PngCompression> for png::Compression {
+    fn from(value: PngCompression) -> Self {
+        match value {
+            PngCompression::NoCompression => png::Compression::NoCompression,
+            PngCompression::Fastest => png::Compression::Fastest,
+            PngCompression::Fast => png::Compression::Fast,
+            PngCompression::Balanced => png::Compression::Balanced,
+            PngCompression::High => png::Compression::High,
+        }
+    }
+}
+
+display_possible_values!(PngCompression);
 
 /// An in-development feature that may be changed or removed at any time.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum, Serialize)]
