@@ -25,6 +25,10 @@ pub fn render_image(
     let view_width = size.x.to_f32();
     let view_height = size.y.to_f32();
 
+    if try_blit_opaque(canvas, &state, image, view_width, view_height).is_some() {
+        return Some(());
+    }
+
     // For better-looking output, resize `image` to its final size before
     // painting it to `canvas`. For the math, see:
     // https://github.com/typst/typst/issues/1404#issuecomment-1598374652
@@ -60,6 +64,97 @@ pub fn render_image(
 
     let rect = sk::Rect::from_xywh(0.0, 0.0, view_width, view_height)?;
     canvas.fill_rect(rect, &paint, ts, state.mask);
+
+    Some(())
+}
+
+/// Fast path for a common but expensive case: a fully opaque raster image
+/// painted at its native resolution with no rotation, skew, flip, or mask
+/// (e.g. a full-bleed background on a large page/poster).
+///
+/// The general path always builds a full extra `sk::Pixmap` texture (RGBA8,
+/// same pixel count as the source) purely to hand off to tiny-skia's
+/// `Pattern` shader, then does a second full compositing pass over the
+/// canvas. When the image is opaque, `src over dst` with `srcAlpha == 1`
+/// equals `src` regardless of `dst`, so we can skip both: convert and write
+/// each source pixel directly into its final canvas position. For a large
+/// image this roughly halves peak memory (no texture buffer) and skips a
+/// redundant full-canvas blend pass.
+///
+/// Returns `None` (with no side effects) whenever a precondition doesn't
+/// hold, so callers should fall back to the general path unchanged.
+fn try_blit_opaque(
+    canvas: &mut sk::Pixmap,
+    state: &State,
+    image: &Image,
+    view_width: f32,
+    view_height: f32,
+) -> Option<()> {
+    // A mask (e.g. from a clip) requires per-pixel blending against existing
+    // content, which this path doesn't do.
+    if state.mask.is_some() {
+        return None;
+    }
+
+    // Only handle axis-aligned scale + translate: no rotation, skew, or flip.
+    let ts = state.transform;
+    if ts.kx != 0.0 || ts.ky != 0.0 || ts.sx <= 0.0 || ts.sy <= 0.0 {
+        return None;
+    }
+
+    let ImageKind::Raster(raster) = image.kind() else { return None };
+    let dynamic = raster.dynamic();
+
+    // Without an alpha channel, every pixel is fully opaque, so overwriting
+    // is always correct regardless of what's beneath.
+    if dynamic.color().has_alpha() {
+        return None;
+    }
+
+    let src_w = dynamic.width();
+    let src_h = dynamic.height();
+
+    // Compute the destination pixel rect and require it to land exactly on
+    // the pixel grid at the image's native resolution (i.e. no resampling
+    // would be needed by the general path either).
+    let x0 = ts.tx;
+    let y0 = ts.ty;
+    let x1 = ts.sx * view_width + ts.tx;
+    let y1 = ts.sy * view_height + ts.ty;
+
+    const EPS: f32 = 0.01;
+    let (rx0, ry0, rx1, ry1) = (x0.round(), y0.round(), x1.round(), y1.round());
+    if (x0 - rx0).abs() > EPS
+        || (y0 - ry0).abs() > EPS
+        || (x1 - rx1).abs() > EPS
+        || (y1 - ry1).abs() > EPS
+    {
+        return None;
+    }
+
+    let dst_w = (rx1 - rx0) as i64;
+    let dst_h = (ry1 - ry0) as i64;
+    if dst_w != src_w as i64 || dst_h != src_h as i64 {
+        return None;
+    }
+
+    let (dst_x0, dst_y0) = (rx0 as i64, ry0 as i64);
+    if dst_x0 < 0
+        || dst_y0 < 0
+        || dst_x0 + dst_w > canvas.width() as i64
+        || dst_y0 + dst_h > canvas.height() as i64
+    {
+        return None;
+    }
+
+    let canvas_w = canvas.width() as usize;
+    let (dst_x0, dst_y0) = (dst_x0 as usize, dst_y0 as usize);
+    let pixels = canvas.pixels_mut();
+
+    for (x, y, Rgba([r, g, b, _])) in dynamic.pixels() {
+        let idx = (dst_y0 + y as usize) * canvas_w + (dst_x0 + x as usize);
+        pixels[idx] = sk::ColorU8::from_rgba(r, g, b, 255).premultiply();
+    }
 
     Some(())
 }
