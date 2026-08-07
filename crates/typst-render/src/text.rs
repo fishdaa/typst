@@ -102,35 +102,53 @@ fn render_outline_glyph(
     }
 
     // Rasterize the glyph with `pixglyph`.
+    //
+    // `x` and `y` are only the *fractional* pixel offsets (always in
+    // [0, 1)), not the full device position: `pixglyph` derives an integer
+    // anchor (`Bitmap::left`/`top`) and coverage that only depends on the
+    // sub-pixel phase, shifting the whole result by an integer number of
+    // pixels doesn't change it. Caching on the full position would grow
+    // this cache with every distinct device pixel a glyph is ever painted
+    // at (i.e. roughly once per glyph per position on the page) instead of
+    // once per glyph per sub-pixel phase; the integer part is added back to
+    // `bitmap.left`/`top` at the call site, in `write_bitmap`.
     #[comemo::memoize]
     fn rasterize(
         font: &FontInstance,
         id: GlyphId,
-        x: u32,
-        y: u32,
+        x_frac: u32,
+        y_frac: u32,
         size: u32,
     ) -> Option<Arc<Bitmap>> {
         let glyph = pixglyph::Glyph::load(font.ttf(), id)?;
         Some(Arc::new(glyph.rasterize(
-            f32::from_bits(x),
-            f32::from_bits(y),
+            f32::from_bits(x_frac),
+            f32::from_bits(y_frac),
             f32::from_bits(size),
         )))
     }
 
+    let x_int = ts.tx.floor();
+    let y_int = ts.ty.floor();
+    let x_frac = ts.tx - x_int;
+    let y_frac = ts.ty - y_int;
+    let (x_int, y_int) = (x_int as i32, y_int as i32);
+
     // Try to retrieve a prepared glyph or prepare it from scratch if it
     // doesn't exist, yet.
     let bitmap =
-        rasterize(&text.font, id, ts.tx.to_bits(), ts.ty.to_bits(), ppem.to_bits())?;
+        rasterize(&text.font, id, x_frac.to_bits(), y_frac.to_bits(), ppem.to_bits())?;
     match &text.fill {
         Paint::Gradient(gradient) => {
             let sampler = GradientSampler::new(gradient, &state, Size::zero(), true);
-            write_bitmap(canvas, &bitmap, &state, sampler)?;
+            write_bitmap(canvas, &bitmap, x_int, y_int, &state, sampler)?;
         }
         Paint::Solid(color) => {
             write_bitmap(
                 canvas,
                 &bitmap,
+                x_int,
+                y_int,
                 &state,
                 paint::to_sk_color_u8(color.to_process()).premultiply(),
             )?;
@@ -138,7 +156,7 @@ fn render_outline_glyph(
         Paint::Tiling(tiling) => {
             let pixmap = paint::render_tiling_frame(&state, tiling);
             let sampler = TilingSampler::new(tiling, &pixmap, &state, true);
-            write_bitmap(canvas, &bitmap, &state, sampler)?;
+            write_bitmap(canvas, &bitmap, x_int, y_int, &state, sampler)?;
         }
     }
 
@@ -148,6 +166,8 @@ fn render_outline_glyph(
 fn write_bitmap<S: PaintSampler>(
     canvas: &mut sk::Pixmap,
     bitmap: &Bitmap,
+    x_int: i32,
+    y_int: i32,
     state: &State,
     sampler: S,
 ) -> Option<()> {
@@ -159,8 +179,11 @@ fn write_bitmap<S: PaintSampler>(
         let mw = bitmap.width;
         let mh = bitmap.height;
 
-        let left = bitmap.left;
-        let top = bitmap.top;
+        // `bitmap.left`/`top` are relative to the sub-pixel-only position
+        // `rasterize` was called with; add back the integer part of the
+        // true device position (see `rasterize`'s doc comment).
+        let left = bitmap.left + x_int;
+        let top = bitmap.top + y_int;
 
         // Pad the pixmap with 1 pixel in each dimension so that we do
         // not get any problem with floating point errors along their border
@@ -205,9 +228,10 @@ fn write_bitmap<S: PaintSampler>(
         let mh = bitmap.height as i32;
 
         // Determine the pixel bounding box that we actually need to draw.
-        let left = bitmap.left;
+        // (See the comment in the masked branch above re: `x_int`/`y_int`.)
+        let left = bitmap.left + x_int;
         let right = left + mw;
-        let top = bitmap.top;
+        let top = bitmap.top + y_int;
         let bottom = top + mh;
 
         // Blend the glyph bitmap with the existing pixels on the canvas.
