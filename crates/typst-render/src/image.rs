@@ -138,22 +138,37 @@ fn try_blit_opaque(
         return None;
     }
 
+    // The destination rect may extend beyond the canvas: callers rendering a
+    // large page in horizontal bands (see `render_band`) pass a canvas that
+    // only covers one band, so a full-page background image only partially
+    // overlaps it. Clip to the overlap and blit just that portion, rather
+    // than requiring (and, on the general path, allocating a texture for)
+    // the whole image.
     let (dst_x0, dst_y0) = (rx0 as i64, ry0 as i64);
-    if dst_x0 < 0
-        || dst_y0 < 0
-        || dst_x0 + dst_w > canvas.width() as i64
-        || dst_y0 + dst_h > canvas.height() as i64
-    {
+    let clip_x0 = dst_x0.max(0);
+    let clip_y0 = dst_y0.max(0);
+    let clip_x1 = (dst_x0 + dst_w).min(canvas.width() as i64);
+    let clip_y1 = (dst_y0 + dst_h).min(canvas.height() as i64);
+    if clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
+        // No overlap with the canvas at all (e.g. a band that this image
+        // doesn't touch).
         return None;
     }
 
     let canvas_w = canvas.width() as usize;
-    let (dst_x0, dst_y0) = (dst_x0 as usize, dst_y0 as usize);
     let pixels = canvas.pixels_mut();
 
-    for (x, y, Rgba([r, g, b, _])) in dynamic.pixels() {
-        let idx = (dst_y0 + y as usize) * canvas_w + (dst_x0 + x as usize);
-        pixels[idx] = sk::ColorU8::from_rgba(r, g, b, 255).premultiply();
+    // Source-space row/column range that maps into the clipped destination
+    // rect (still a 1:1 mapping, since we required native resolution above).
+    let src_y_range = (clip_y0 - dst_y0) as u32..(clip_y1 - dst_y0) as u32;
+    let src_x_range = (clip_x0 - dst_x0) as u32..(clip_x1 - dst_x0) as u32;
+    for sy in src_y_range {
+        let py = (dst_y0 + sy as i64) as usize;
+        for sx in src_x_range.clone() {
+            let px = (dst_x0 + sx as i64) as usize;
+            let Rgba([r, g, b, _]) = dynamic.get_pixel(sx, sy);
+            pixels[py * canvas_w + px] = sk::ColorU8::from_rgba(r, g, b, 255).premultiply();
+        }
     }
 
     Some(())

@@ -13,35 +13,132 @@ use typst_library::layout::{
 use typst_library::visualize::{Color, Geometry, Paint};
 use typst_utils::Scalar;
 
+/// The page geometry shared by [`render`] and [`render_band`].
+struct PageGeometry {
+    bleed: Sides<Abs>,
+    size: Size,
+    pixel_per_pt: f32,
+    pxw: u32,
+    pxh: u32,
+}
+
+fn page_geometry(page: &Page, opts: &RenderOptions) -> PageGeometry {
+    let bleed = if opts.render_bleed { page.bleed } else { Sides::default() };
+    let size = page.frame.size() + bleed.sum_by_axis();
+    let pixel_per_pt = opts.pixel_per_pt.get() as f32;
+    let pxw = (pixel_per_pt * size.x.to_f32()).round().max(1.0) as u32;
+    let pxh = (pixel_per_pt * size.y.to_f32()).round().max(1.0) as u32;
+    PageGeometry { bleed, size, pixel_per_pt, pxw, pxh }
+}
+
+/// Paints the page's background fill (solid color or gradient/pattern) onto
+/// `canvas`, which may be the full page or a single band of it.
+fn paint_background(canvas: &mut sk::Pixmap, state: State, page: &Page, size: Size) {
+    if let Some(fill) = page.fill_or_white() {
+        if let Paint::Solid(color) = fill {
+            canvas.fill(paint::to_sk_color(color.to_process()));
+        } else {
+            let rect = Geometry::Rect(size).filled(fill);
+            shape::render_shape(canvas, state, &rect);
+        }
+    }
+}
+
+/// Returns whether any paint in `page` (background, shape fill/stroke, or
+/// text fill/stroke) is a gradient or tiling pattern.
+///
+/// [`render_band`] renders each band with its own transform, offset by the
+/// band's absolute position. A `relative: "parent"` gradient or pattern
+/// computes its placement as `container_transform.post_concat(transform
+/// .invert())`, which should cancel that offset out algebraically -- but
+/// since `sk::Transform` is f32-only, subtracting two large,
+/// nearly-equal values loses precision in the low bits where the true
+/// (small) result lives, producing a small but real color error at typical
+/// page sizes. Callers should render pages for which this returns `true` as
+/// a single band (i.e. the whole page), matching the un-banded behavior.
+pub fn uses_relative_paint(page: &Page) -> bool {
+    fn is_relative_paint(paint: &Paint) -> bool {
+        matches!(paint, Paint::Gradient(_) | Paint::Tiling(_))
+    }
+
+    fn check_frame(frame: &Frame) -> bool {
+        frame.items().any(|(_, item)| match item {
+            FrameItem::Group(group) => check_frame(&group.frame),
+            FrameItem::Text(text) => {
+                is_relative_paint(&text.fill)
+                    || text
+                        .stroke
+                        .as_ref()
+                        .is_some_and(|stroke| is_relative_paint(&stroke.paint))
+            }
+            FrameItem::Shape(shape, _) => {
+                shape.fill.as_ref().is_some_and(is_relative_paint)
+                    || shape
+                        .stroke
+                        .as_ref()
+                        .is_some_and(|stroke| is_relative_paint(&stroke.paint))
+            }
+            FrameItem::Image(..) | FrameItem::Link(..) | FrameItem::Tag(..) => false,
+        })
+    }
+
+    page.fill_or_white().is_some_and(|fill| is_relative_paint(&fill))
+        || check_frame(&page.frame)
+}
+
+/// Returns the device-pixel dimensions that [`render`] (or [`render_band`])
+/// would produce for `page` at the given options, without rendering
+/// anything. Useful for a caller that wants to pick a band size for
+/// [`render_band`] ahead of time.
+pub fn pixel_dimensions(page: &Page, opts: &RenderOptions) -> (u32, u32) {
+    let geo = page_geometry(page, opts);
+    (geo.pxw, geo.pxh)
+}
+
 /// Export a page into a raster image.
 ///
 /// This renders the page at the given number of pixels per point and returns
 /// the resulting `tiny-skia` pixel buffer.
 #[typst_macros::time(name = "render")]
 pub fn render(page: &Page, opts: &RenderOptions) -> sk::Pixmap {
-    let bleed = if opts.render_bleed { page.bleed } else { Sides::default() };
+    let geo = page_geometry(page, opts);
+    let ts = sk::Transform::from_scale(geo.pixel_per_pt, geo.pixel_per_pt);
+    let state = State::new(geo.size, ts, geo.pixel_per_pt);
 
-    let size = page.frame.size() + bleed.sum_by_axis();
-    let pixel_per_pt = opts.pixel_per_pt.get() as f32;
-    let pxw = (pixel_per_pt * size.x.to_f32()).round().max(1.0) as u32;
-    let pxh = (pixel_per_pt * size.y.to_f32()).round().max(1.0) as u32;
+    let mut canvas = sk::Pixmap::new(geo.pxw, geo.pxh).unwrap();
+    paint_background(&mut canvas, state, page, geo.size);
 
-    let ts = sk::Transform::from_scale(pixel_per_pt, pixel_per_pt);
-    let state = State::new(size, ts, pixel_per_pt);
+    let state = state.pre_translate(Point { x: geo.bleed.left, y: geo.bleed.top });
+    render_frame(&mut canvas, state, &page.frame);
 
-    let mut canvas = sk::Pixmap::new(pxw, pxh).unwrap();
+    canvas
+}
 
-    if let Some(fill) = page.fill_or_white() {
-        if let Paint::Solid(color) = fill {
-            canvas.fill(paint::to_sk_color(color.to_process()));
-        } else {
-            let rect = Geometry::Rect(size).filled(fill);
-            shape::render_shape(&mut canvas, state, &rect);
-        }
-    }
+/// Render a horizontal band of a page into a small pixmap, covering device
+/// pixel rows `y_offset_px..y_offset_px + band_height_px` of the full page.
+///
+/// This lets a caller export a very large page (e.g. a large-format poster)
+/// without holding the full-page canvas in memory at once: render each band,
+/// stream it out (e.g. to a PNG encoder), and drop it before rendering the
+/// next one. Each call re-walks the whole frame, so this trades some
+/// redundant tree-walking for materializing only `band_height_px` rows of
+/// pixels at a time instead of the whole page.
+#[typst_macros::time(name = "render band")]
+pub fn render_band(
+    page: &Page,
+    opts: &RenderOptions,
+    y_offset_px: u32,
+    band_height_px: u32,
+) -> sk::Pixmap {
+    let geo = page_geometry(page, opts);
+    let ts = sk::Transform::from_scale(geo.pixel_per_pt, geo.pixel_per_pt)
+        .post_translate(0.0, -(y_offset_px as f32));
+    let state = State::new(geo.size, ts, geo.pixel_per_pt);
 
-    let state = state.pre_translate(Point { x: bleed.left, y: bleed.top });
+    let mut canvas = sk::Pixmap::new(geo.pxw, band_height_px).unwrap();
+    paint_background(&mut canvas, state, page, geo.size);
 
+    let state = state.pre_translate(Point { x: geo.bleed.left, y: geo.bleed.top });
     render_frame(&mut canvas, state, &page.frame);
 
     canvas

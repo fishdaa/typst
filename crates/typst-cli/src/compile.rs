@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::Path;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
@@ -575,8 +576,7 @@ fn export_image_page(
     match fmt {
         ImageExportFormat::Png => {
             let options = png_options(config);
-            let pixmap = typst_render::render(page, &options);
-            let buf = encode_png(pixmap, config.png_compression)
+            let buf = render_and_encode_png_in_bands(page, &options, config.png_compression)
                 .map_err(|err| eco_format!("failed to encode PNG file ({err})"))?;
             output
                 .write(&buf)
@@ -593,21 +593,38 @@ fn export_image_page(
     Ok(())
 }
 
-/// Encodes a rendered page as a PNG, honoring the configured compression
-/// effort.
+/// The largest amount of raw pixel data (RGBA8) to materialize for one band
+/// when rendering a page in bands. Keeps memory bounded regardless of page
+/// size: e.g. at a poster's width (~7200px) this yields bands of roughly
+/// 500 rows.
+const MAX_BAND_BYTES: usize = 16 * 1024 * 1024;
+
+/// Renders a page and encodes it as a PNG, honoring the configured
+/// compression effort, without ever materializing the full-page canvas in
+/// memory at once.
 ///
 /// This reimplements `tiny_skia::Pixmap::encode_png` instead of calling it
 /// directly for two reasons: that method hardcodes the `png` crate's default
-/// compression (`Balanced`, slow for very large pages), and it takes `&self`,
-/// forcing an extra full-buffer clone before demultiplying alpha. Consuming
-/// `pixmap` by value here avoids that clone.
-fn encode_png(
-    pixmap: tiny_skia::Pixmap,
+/// compression (`Balanced`, slow for very large pages), and it always
+/// operates on a whole `Pixmap`, which for a large page (e.g. a big poster)
+/// means holding the whole rendered canvas in memory. Instead, render and
+/// stream out one horizontal band at a time via `typst_render::render_band`,
+/// so peak memory is bounded by a single band rather than the full page.
+fn render_and_encode_png_in_bands(
+    page: &Page,
+    opts: &RenderOptions,
     compression: PngCompression,
 ) -> Result<Vec<u8>, png::EncodingError> {
-    let width = pixmap.width();
-    let height = pixmap.height();
-    let demultiplied_data = pixmap.take_demultiplied();
+    let (width, height) = typst_render::pixel_dimensions(page, opts);
+    let row_bytes = (width as usize).saturating_mul(4).max(1);
+    let band_rows = if typst_render::uses_relative_paint(page) {
+        // See `uses_relative_paint`: banding a gradient/pattern can shift its
+        // colors slightly due to f32 precision loss, so render such pages as
+        // a single band (the whole page), matching un-banded behavior.
+        height.max(1)
+    } else {
+        ((MAX_BAND_BYTES / row_bytes) as u32).clamp(1, height.max(1))
+    };
 
     let mut data = Vec::new();
     {
@@ -616,7 +633,18 @@ fn encode_png(
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(compression.into());
         let mut writer = encoder.write_header()?;
-        writer.write_image_data(&demultiplied_data)?;
+        let mut stream = writer.stream_writer()?;
+
+        let mut y = 0;
+        while y < height {
+            let band_height = band_rows.min(height - y);
+            let band = typst_render::render_band(page, opts, y, band_height);
+            let demultiplied_data = band.take_demultiplied();
+            stream.write_all(&demultiplied_data)?;
+            y += band_height;
+        }
+
+        stream.finish()?;
     }
 
     Ok(data)
