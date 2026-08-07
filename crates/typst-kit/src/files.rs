@@ -110,9 +110,21 @@ where
     /// performance.
     pub fn reset(&mut self) {
         #[allow(clippy::iter_over_hash_type, reason = "order does not matter")]
-        for slot in self.slots.get_mut().values_mut() {
+        self.slots.get_mut().retain(|_, slot| {
+            // A slot that's already `Empty(None)` going into this reset
+            // hasn't been accessed since the *previous* reset either, and
+            // (per `FileSlot::reset`) has no stale source worth keeping.
+            // Drop it now instead of retaining it forever: without this, a
+            // long-running `watch` session accumulates one entry per
+            // distinct file ever referenced, even for files no longer part
+            // of the document (e.g. a removed `#include` or a swapped
+            // image path).
+            if matches!(slot, FileSlot::Empty(None)) {
+                return false;
+            }
             slot.reset();
-        }
+            true
+        });
     }
 
     /// Access the canonical slot for the given file id.
@@ -415,6 +427,41 @@ mod tests {
         store.source(id("d.typ")).must_be("5");
         store.file(id("e.bin")).must_be(E_TEXT);
         assert_eq!(deps(&mut store), ["d.typ", "e.bin"]);
+    }
+
+    /// Check that a file unaccessed for long enough is dropped from the
+    /// store entirely, instead of accumulating forever.
+    #[test]
+    fn test_file_store_evicts_stale_slots() {
+        let mut store = FileStore::new(TestLoader(1));
+        store.source(id("a.typ")).must_be(A_TEXT);
+        store.source(id("d.typ")).must_be("1");
+        assert_eq!(store.slots.lock().len(), 2);
+
+        // First reset: nothing is dropped yet. Both slots transition from
+        // `Parsed` to `Empty(Some(source))`, keeping a stale, reusable
+        // `Source` from before this reset.
+        store.reset();
+        assert_eq!(store.slots.lock().len(), 2);
+
+        // Access only "d.typ" again; "a.typ" is now unaccessed for a whole
+        // cycle, with a stale source it never got to reuse.
+        store.source(id("d.typ")).must_be("1");
+
+        // Second reset: "a.typ" is still present, but its `reset()` call
+        // (per `FileSlot::reset`, which only preserves a stale source when
+        // coming from `Parsed`) now discards that unused stale source,
+        // leaving it `Empty(None)`.
+        store.reset();
+        assert_eq!(store.slots.lock().len(), 2);
+
+        store.source(id("d.typ")).must_be("1");
+
+        // Third reset: "a.typ" was already `Empty(None)` going into it --
+        // unaccessed for two full cycles with nothing left to reuse -- so it
+        // finally gets dropped.
+        store.reset();
+        assert_eq!(store.slots.lock().len(), 1);
     }
 
     const A_TEXT: &str = "Hello from A";
