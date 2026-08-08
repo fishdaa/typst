@@ -21,6 +21,7 @@ typst-timing = { workspace = true }
 typst-utils = { workspace = true }
 bytemuck = { workspace = true }
 comemo = { workspace = true }
+fast_image_resize = { workspace = true }
 hayro = { workspace = true }
 image = { workspace = true }
 libm = { workspace = true }

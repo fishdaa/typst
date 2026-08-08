@@ -1,9 +1,10 @@
+use fast_image_resize::images::Image as FirImage;
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use hayro::RenderCache;
 use hayro::RenderSettings;
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_interpret::font::{FontData, FontQuery, StandardFont};
 use hayro::vello_cpu::color::palette::css::TRANSPARENT;
-use image::imageops::FilterType;
 use image::{GenericImageView, Rgba};
 use std::sync::Arc;
 use tiny_skia as sk;
@@ -183,25 +184,44 @@ fn build_texture(image: &Image, w: u32, h: u32) -> Option<Arc<sk::Pixmap>> {
             let w = texture.width();
             let h = texture.height();
 
-            let buf;
             let dynamic = raster.dynamic();
-            let resized = if (w, h) == (dynamic.width(), dynamic.height()) {
+            if (w, h) == (dynamic.width(), dynamic.height()) {
                 // Small optimization to not allocate in case image is not resized.
-                dynamic
+                for ((_, _, Rgba([r, g, b, a])), dest) in
+                    dynamic.pixels().zip(texture.pixels_mut())
+                {
+                    *dest = sk::ColorU8::from_rgba(r, g, b, a).premultiply();
+                }
             } else {
                 let upscale = w > dynamic.width();
                 let filter = match image.scaling() {
-                    Smart::Custom(ImageScaling::Pixelated) => FilterType::Nearest,
-                    _ if upscale => FilterType::CatmullRom,
-                    _ => FilterType::Lanczos3, // downscale
+                    Smart::Custom(ImageScaling::Pixelated) => None,
+                    _ if upscale => Some(FilterType::CatmullRom),
+                    _ => Some(FilterType::Lanczos3), // downscale
                 };
-                buf = dynamic.resize_exact(w, h, filter);
-                &buf
-            };
+                let alg = match filter {
+                    Some(filter) => ResizeAlg::Convolution(filter),
+                    None => ResizeAlg::Nearest,
+                };
 
-            for ((_, _, src), dest) in resized.pixels().zip(texture.pixels_mut()) {
-                let Rgba([r, g, b, a]) = src;
-                *dest = sk::ColorU8::from_rgba(r, g, b, a).premultiply();
+                // Resizing (rather than the final premultiply pass below) is
+                // the expensive part for a large placed image (e.g. a
+                // full-bleed poster/certificate background), so this uses
+                // `fast_image_resize`, which is SIMD-accelerated and (via its
+                // `rayon` feature) parallelizes the convolution across
+                // threads, instead of `image`'s single-threaded scalar
+                // resize.
+                let src = dynamic.to_rgba8();
+                let mut dst = FirImage::new(w, h, PixelType::U8x4);
+                Resizer::new()
+                    .resize(&src, &mut dst, &ResizeOptions::new().resize_alg(alg))
+                    .ok()?;
+
+                let chunks = dst.buffer().chunks_exact(4);
+                for (src, dest) in chunks.zip(texture.pixels_mut()) {
+                    *dest = sk::ColorU8::from_rgba(src[0], src[1], src[2], src[3])
+                        .premultiply();
+                }
             }
 
             texture
