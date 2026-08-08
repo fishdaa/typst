@@ -327,43 +327,31 @@ fn try_blit_resized_axis_aligned(
     // in memory at once (see `RasterImage::decode_rgba_row_range`). Falls
     // back to the fully decoded, fully converted buffer when the source
     // doesn't qualify (not PNG, interlaced, EXIF-rotated, etc.).
-    fn rss_kb() -> u64 {
-        std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines().find_map(|l| {
-                    l.strip_prefix("VmRSS:")
-                        .and_then(|v| v.trim().split_whitespace().next())
-                        .and_then(|v| v.parse().ok())
-                })
-            })
-            .unwrap_or(0)
-    }
-
     let row_lo = crop_top.floor().max(0.0) as u32;
     let row_hi = (crop_top + crop_height).ceil().min(src_h as f64) as u32;
     let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
     let opts = ResizeOptions::new().resize_alg(alg);
-    eprintln!(
-        "DEBUG resized_axis_aligned row_lo={row_lo} row_hi={row_hi} src_h={src_h} crop_w={crop_w} crop_h={crop_h} rss_before={}kB",
-        rss_kb()
-    );
     if let Some(region) = raster.decode_rgba_row_range(row_lo, row_hi) {
-        eprintln!("DEBUG   -> row_range path taken, rss_after_decode={}kB", rss_kb());
         let region_h = row_hi - row_lo;
         let region_img =
             FirImage::from_vec_u8(src_w, region_h, region, PixelType::U8x4).ok()?;
-        let opts =
-            opts.crop(crop_left, crop_top - row_lo as f64, crop_width, crop_height);
+        // `row_hi`/the region's actual height are clamped to `src_h`, but
+        // `crop_height` (and, symmetrically, `crop_width` against `src_w`)
+        // are derived from the destination-side margin before that clamp,
+        // so at the image's bottom/right edge the nominal crop rect can
+        // extend past the decoded region -- clamp it back to what was
+        // actually decoded, matching the real (already-clamped) source
+        // bounds `fast_image_resize` would otherwise reject.
+        let local_crop_top = crop_top - row_lo as f64;
+        let crop_height = crop_height.min(region_h as f64 - local_crop_top);
+        let crop_width = crop_width.min(src_w as f64 - crop_left);
+        let opts = opts.crop(crop_left, local_crop_top, crop_width, crop_height);
         Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
-        eprintln!("DEBUG   -> rss_after_resize={}kB", rss_kb());
     } else {
-        eprintln!("DEBUG   -> FALLBACK full-decode path taken");
         let src = to_rgba8(image)?;
         let opts = opts.crop(crop_left, crop_top, crop_width, crop_height);
         Resizer::new().resize(src.as_ref(), &mut resized, &opts).ok()?;
     }
-    eprintln!("DEBUG   -> rss_end_of_fn={}kB", rss_kb());
 
     let (tile_w, tile_h) = ((clip_x1 - clip_x0) as u32, (clip_y1 - clip_y0) as u32);
     let mut tile = sk::Pixmap::new(tile_w, tile_h)?;

@@ -626,7 +626,6 @@ fn render_and_encode_png_in_bands(
         ((MAX_BAND_BYTES / row_bytes) as u32).clamp(1, height.max(1))
     };
 
-    eprintln!("DEBUG band_rows={band_rows} height={height} width={width}");
     let mut data = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut data, width, height);
@@ -636,29 +635,12 @@ fn render_and_encode_png_in_bands(
         let mut writer = encoder.write_header()?;
         let mut stream = writer.stream_writer()?;
 
-        fn rss_kb() -> u64 {
-            std::fs::read_to_string("/proc/self/status")
-                .ok()
-                .and_then(|s| {
-                    s.lines().find_map(|l| {
-                        l.strip_prefix("VmRSS:")
-                            .and_then(|v| v.trim().split_whitespace().next())
-                            .and_then(|v| v.parse().ok())
-                    })
-                })
-                .unwrap_or(0)
-        }
-
         let mut y = 0;
         while y < height {
-            eprintln!("DEBUG before band y={y} rss={}kB", rss_kb());
             let band_height = band_rows.min(height - y);
             let band = typst_render::render_band(page, opts, y, band_height);
-            eprintln!("DEBUG after render_band rss={}kB", rss_kb());
             let demultiplied_data = band.take_demultiplied();
-            eprintln!("DEBUG after take_demultiplied rss={}kB", rss_kb());
             stream.write_all(&demultiplied_data)?;
-            eprintln!("DEBUG after write_all rss={}kB", rss_kb());
             y += band_height;
         }
 
