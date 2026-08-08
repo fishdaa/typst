@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::diag::{StrResult, bail};
 use crate::foundations::{Bytes, Cast, Dict, Smart, Value, cast, dict};
@@ -38,6 +38,48 @@ struct RasterImageInner {
     exif_rotation: Option<u32>,
     icc: Option<Bytes>,
     dpi: Option<f64>,
+    /// A decoder positioned partway through the image, reused across
+    /// successive [`RasterImage::decode_rgba_row_range`] calls that request
+    /// increasing row ranges (the common case: a band-rendered page decodes
+    /// each image top-to-bottom, one row range per band). Without this,
+    /// every call would restart decoding from row 0 -- since PNG rows are
+    /// filtered against the previous row, there's no way to seek directly to
+    /// a later row -- making a full band-by-band render of an image
+    /// `O(bands * height)` instead of `O(height)`.
+    row_cursor: Mutex<Option<RowCursor>>,
+}
+
+/// A `png` reader paused after decoding up to (but not including) `next_row`.
+struct RowCursor {
+    reader: png::Reader<io::Cursor<Bytes>>,
+    next_row: u32,
+    width: u32,
+    channels: u8,
+}
+
+impl RowCursor {
+    /// Opens a fresh reader positioned at row 0. Returns `None` for anything
+    /// [`RasterImage::decode_rgba_row_range`] doesn't support.
+    fn new(data: &Bytes) -> Option<Self> {
+        let reader = png_reader(data.clone()).ok()?;
+        let width = {
+            let info = reader.info();
+            if info.interlaced {
+                return None;
+            }
+            info.width
+        };
+        let (color_type, bit_depth) = reader.output_color_type();
+        if bit_depth != png::BitDepth::Eight {
+            return None;
+        }
+        let channels = match color_type {
+            png::ColorType::Rgb => 3,
+            png::ColorType::Rgba => 4,
+            _ => return None,
+        };
+        Some(Self { reader, next_row: 0, width, channels })
+    }
 }
 
 impl RasterImage {
@@ -210,6 +252,7 @@ impl RasterImage {
             exif_rotation: exif_rot,
             icc,
             dpi,
+            row_cursor: Mutex::new(None),
         })))
     }
 
@@ -320,36 +363,30 @@ impl RasterImage {
             return None;
         }
 
-        let mut reader = png_reader(&self.0.data).ok()?;
-        let (width, height) = {
-            let info = reader.info();
-            if info.interlaced {
-                return None;
-            }
-            (info.width, info.height)
-        };
+        let mut guard = self.0.row_cursor.lock().unwrap();
 
-        let (color_type, bit_depth) = reader.output_color_type();
-        if bit_depth != png::BitDepth::Eight {
-            return None;
-        }
-        let channels = match color_type {
-            png::ColorType::Rgb => 3,
-            png::ColorType::Rgba => 4,
-            _ => return None,
+        // Reuse the decoder if it's already positioned at or before `y0`
+        // (the common case, since bands are rendered top-to-bottom).
+        // Otherwise -- first call, or a request that rewinds, e.g. the same
+        // image placed twice on a page -- start over from row 0.
+        let cursor = match guard.take() {
+            Some(cursor) if cursor.next_row <= y0 => cursor,
+            _ => RowCursor::new(&self.0.data)?,
         };
+        let RowCursor { mut reader, mut next_row, width, channels } = cursor;
 
+        let height = reader.info().height;
         let y1 = y1.min(height);
         if y0 >= y1 {
+            *guard = Some(RowCursor { reader, next_row, width, channels });
             return Some(Vec::new());
         }
 
         let mut out = vec![0u8; width as usize * (y1 - y0) as usize * 4];
-        let mut row = 0u32;
-        while row < y1 {
+        while next_row < y1 {
             let Some(data) = reader.next_row().ok()? else { break };
-            if row >= y0 {
-                let start = (row - y0) as usize * width as usize * 4;
+            if next_row >= y0 {
+                let start = (next_row - y0) as usize * width as usize * 4;
                 let dest = &mut out[start..start + width as usize * 4];
                 if channels == 4 {
                     dest.copy_from_slice(data.data());
@@ -362,9 +399,10 @@ impl RasterImage {
                     }
                 }
             }
-            row += 1;
+            next_row += 1;
         }
 
+        *guard = Some(RowCursor { reader, next_row, width, channels });
         Some(out)
     }
 }
@@ -508,8 +546,8 @@ impl From<PixelFormat> for Dict {
 /// decoder uses, so `output_color_type` and row data match what
 /// `image::DynamicImage::from_decoder` would eventually produce.
 fn png_reader(
-    data: &Bytes,
-) -> Result<png::Reader<io::Cursor<&Bytes>>, png::DecodingError> {
+    data: Bytes,
+) -> Result<png::Reader<io::Cursor<Bytes>>, png::DecodingError> {
     let mut decoder = png::Decoder::new(io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::EXPAND);
     decoder.read_info()
@@ -525,7 +563,7 @@ fn validate_png(
     data: &Bytes,
     icc: Smart<Bytes>,
 ) -> StrResult<(u32, u32, bool, Option<Bytes>)> {
-    let mut reader = png_reader(data).map_err(png_error_message)?;
+    let mut reader = png_reader(data.clone()).map_err(png_error_message)?;
 
     let (width, height) = {
         let info = reader.info();
