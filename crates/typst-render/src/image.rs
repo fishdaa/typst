@@ -30,6 +30,12 @@ pub fn render_image(
         return Some(());
     }
 
+    if try_blit_resized_axis_aligned(canvas, &state, image, view_width, view_height)
+        .is_some()
+    {
+        return Some(());
+    }
+
     // For better-looking output, resize `image` to its final size before
     // painting it to `canvas`. For the math, see:
     // https://github.com/typst/typst/issues/1404#issuecomment-1598374652
@@ -175,6 +181,170 @@ fn try_blit_opaque(
     Some(())
 }
 
+/// Fast path for a raster image that needs resampling (i.e. doesn't qualify
+/// for `try_blit_opaque`) but is placed axis-aligned and pixel-grid-aligned.
+///
+/// The general path (`build_texture`) resamples the *entire* placed image
+/// into a texture sized to its full destination extent, even when the
+/// visible canvas only covers a fraction of it -- e.g. one horizontal band
+/// of a large poster (see `render_band`). For a large upscaled background,
+/// that full-extent texture (and the resize buffer used to build it) can be
+/// hundreds of megabytes or more, held for the whole export even though any
+/// single band only needs a sliver of it.
+///
+/// This instead resamples only the source region that maps to the visible
+/// canvas, plus a small margin for the resampling filter's kernel support,
+/// using `fast_image_resize`'s source cropping to crop before resizing. The
+/// crop is constructed so its implied scale factor exactly matches the
+/// unclipped resize's scale factor, keeping both on the same sampling grid;
+/// residual differences from resizing in pieces rather than all at once are
+/// sub-pixel floating-point rounding at tile seams (a couple of levels out
+/// of 255), not a change in method.
+///
+/// Returns `None` (with no side effects) whenever a precondition doesn't
+/// hold, so callers should fall back to the general path unchanged.
+fn try_blit_resized_axis_aligned(
+    canvas: &mut sk::Pixmap,
+    state: &State,
+    image: &Image,
+    view_width: f32,
+    view_height: f32,
+) -> Option<()> {
+    // Only handle axis-aligned scale + translate: no rotation, skew, or flip.
+    let ts = state.transform;
+    if ts.kx != 0.0 || ts.ky != 0.0 || ts.sx <= 0.0 || ts.sy <= 0.0 {
+        return None;
+    }
+
+    let ImageKind::Raster(raster) = image.kind() else { return None };
+    let dynamic = raster.dynamic();
+    let (src_w, src_h) = (dynamic.width(), dynamic.height());
+
+    // Compute the destination pixel rect and require it to land exactly on
+    // the pixel grid, so tiles can be copied into the canvas without needing
+    // edge antialiasing.
+    let x0 = ts.tx;
+    let y0 = ts.ty;
+    let x1 = ts.sx * view_width + ts.tx;
+    let y1 = ts.sy * view_height + ts.ty;
+
+    const EPS: f32 = 0.01;
+    let (rx0, ry0, rx1, ry1) = (x0.round(), y0.round(), x1.round(), y1.round());
+    if (x0 - rx0).abs() > EPS
+        || (y0 - ry0).abs() > EPS
+        || (x1 - rx1).abs() > EPS
+        || (y1 - ry1).abs() > EPS
+    {
+        return None;
+    }
+
+    let dst_x0 = rx0 as i64;
+    let dst_y0 = ry0 as i64;
+    let (dst_w, dst_h) = (rx1 - rx0, ry1 - ry0);
+    if dst_w <= 0.0 || dst_h <= 0.0 || (dst_w, dst_h) == (src_w as f32, src_h as f32) {
+        // Either degenerate, or exactly native resolution -- the latter is
+        // `try_blit_opaque`'s job when opaque, and otherwise cheap enough
+        // (a straight copy, no resampling) for the general path to handle.
+        return None;
+    }
+    let (dst_w, dst_h) = (dst_w as u32, dst_h as u32);
+
+    // The destination rect may extend beyond the canvas: callers rendering a
+    // large page in horizontal bands (see `render_band`) pass a canvas that
+    // only covers one band, so a full-page background image only partially
+    // overlaps it.
+    let clip_x0 = dst_x0.max(0);
+    let clip_y0 = dst_y0.max(0);
+    let clip_x1 = (dst_x0 + dst_w as i64).min(canvas.width() as i64);
+    let clip_y1 = (dst_y0 + dst_h as i64).min(canvas.height() as i64);
+    if clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
+        // No overlap with this band/canvas at all.
+        return Some(());
+    }
+
+    let scale_x = src_w as f64 / dst_w as f64;
+    let scale_y = src_h as f64 / dst_h as f64;
+    let upscale = dst_w > src_w || dst_h > src_h;
+    let (alg, support) = match image.scaling() {
+        Smart::Custom(ImageScaling::Pixelated) => (ResizeAlg::Nearest, 0.0),
+        _ if upscale => (ResizeAlg::Convolution(FilterType::CatmullRom), 2.0),
+        _ => (ResizeAlg::Convolution(FilterType::Lanczos3), 3.0),
+    };
+
+    // Expand the visible tile by the filter's kernel support (plus a little
+    // slack) on each side, in destination pixels, then crop the source to
+    // the matching region -- so pixels near the tile's edges are resampled
+    // from the same neighborhood an unclipped resize would have used.
+    let margin_x = (support * scale_x.max(1.0)).ceil() as i64 + 2;
+    let margin_y = (support * scale_y.max(1.0)).ceil() as i64 + 2;
+
+    let local_x0 = clip_x0 - dst_x0;
+    let local_y0 = clip_y0 - dst_y0;
+    let local_x1 = clip_x1 - dst_x0;
+    let local_y1 = clip_y1 - dst_y0;
+
+    let start_x = (local_x0 - margin_x).clamp(0, dst_w as i64) as u32;
+    let start_y = (local_y0 - margin_y).clamp(0, dst_h as i64) as u32;
+    let end_x = (local_x1 + margin_x).clamp(0, dst_w as i64) as u32;
+    let end_y = (local_y1 + margin_y).clamp(0, dst_h as i64) as u32;
+    let (crop_w, crop_h) = (end_x - start_x, end_y - start_y);
+    if crop_w == 0 || crop_h == 0 {
+        return Some(());
+    }
+
+    // Constructed so the crop's own implied scale factor is exactly
+    // `scale_x`/`scale_y` -- i.e. identical to the unclipped resize's --
+    // rather than picking a source crop and rounding the destination size
+    // independently, which would drift the sampling grid across tiles.
+    let crop_left = start_x as f64 * scale_x;
+    let crop_top = start_y as f64 * scale_y;
+    let crop_width = crop_w as f64 * scale_x;
+    let crop_height = crop_h as f64 * scale_y;
+
+    let src = to_rgba8(image)?;
+    let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
+    let opts = ResizeOptions::new()
+        .resize_alg(alg)
+        .crop(crop_left, crop_top, crop_width, crop_height);
+    Resizer::new().resize(src.as_ref(), &mut resized, &opts).ok()?;
+
+    let (tile_w, tile_h) = ((clip_x1 - clip_x0) as u32, (clip_y1 - clip_y0) as u32);
+    let mut tile = sk::Pixmap::new(tile_w, tile_h)?;
+    let offset_x = (local_x0 as u32) - start_x;
+    let offset_y = (local_y0 as u32) - start_y;
+    let buf = resized.buffer();
+    for row in 0..tile_h {
+        let row_start = (((offset_y + row) * crop_w + offset_x) * 4) as usize;
+        let row_bytes = &buf[row_start..row_start + (tile_w as usize) * 4];
+        let dest_start = (row * tile_w) as usize;
+        let dest_row = &mut tile.pixels_mut()[dest_start..dest_start + tile_w as usize];
+        for (chunk, dest) in row_bytes.chunks_exact(4).zip(dest_row) {
+            *dest = sk::ColorU8::from_rgba(chunk[0], chunk[1], chunk[2], chunk[3])
+                .premultiply();
+        }
+    }
+
+    canvas.draw_pixmap(
+        clip_x0 as i32,
+        clip_y0 as i32,
+        tile.as_ref(),
+        &sk::PixmapPaint::default(),
+        sk::Transform::identity(),
+        state.mask,
+    );
+
+    Some(())
+}
+
+/// Converts a raster image to RGBA8, memoized so repeated calls (e.g. once
+/// per rendered band of a large page) reuse the same buffer instead of
+/// redecoding/reconverting the whole source image each time.
+#[comemo::memoize]
+fn to_rgba8(image: &Image) -> Option<Arc<image::RgbaImage>> {
+    let ImageKind::Raster(raster) = image.kind() else { return None };
+    Some(Arc::new(raster.dynamic().to_rgba8()))
+}
+
 /// Prepare a texture for an image at a scaled size.
 #[comemo::memoize]
 fn build_texture(image: &Image, w: u32, h: u32) -> Option<Arc<sk::Pixmap>> {
@@ -211,10 +381,10 @@ fn build_texture(image: &Image, w: u32, h: u32) -> Option<Arc<sk::Pixmap>> {
                 // `rayon` feature) parallelizes the convolution across
                 // threads, instead of `image`'s single-threaded scalar
                 // resize.
-                let src = dynamic.to_rgba8();
+                let src = to_rgba8(image)?;
                 let mut dst = FirImage::new(w, h, PixelType::U8x4);
                 Resizer::new()
-                    .resize(&src, &mut dst, &ResizeOptions::new().resize_alg(alg))
+                    .resize(src.as_ref(), &mut dst, &ResizeOptions::new().resize_alg(alg))
                     .ok()?;
 
                 let chunks = dst.buffer().chunks_exact(4);
