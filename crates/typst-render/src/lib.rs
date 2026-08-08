@@ -151,14 +151,19 @@ pub fn render_merged(
     gap: Abs,
     fill: Option<Color>,
 ) -> sk::Pixmap {
-    let pixmaps: Vec<_> =
-        document.pages().iter().map(|page| render(page, opts)).collect();
-
     let pixel_per_pt = opts.pixel_per_pt.get() as f32;
     let gap = (pixel_per_pt * gap.to_f32()).round() as u32;
-    let pxw = pixmaps.iter().map(sk::Pixmap::width).max().unwrap_or_default();
-    let pxh = pixmaps.iter().map(|pixmap| pixmap.height()).sum::<u32>()
-        + gap * pixmaps.len().saturating_sub(1) as u32;
+
+    // Compute the merged canvas's size from each page's pixel dimensions
+    // alone, without rendering anything -- so we don't need to hold every
+    // page's full canvas in memory just to find their sizes. Pages are then
+    // rendered and drawn one at a time below, so at most one page's canvas
+    // (rather than every page's) is resident alongside the merged canvas.
+    let sizes: Vec<(u32, u32)> =
+        document.pages().iter().map(|page| pixel_dimensions(page, opts)).collect();
+    let pxw = sizes.iter().map(|&(w, _)| w).max().unwrap_or_default();
+    let pxh = sizes.iter().map(|&(_, h)| h).sum::<u32>()
+        + gap * sizes.len().saturating_sub(1) as u32;
 
     let mut canvas = sk::Pixmap::new(pxw, pxh).unwrap();
     if let Some(fill) = fill {
@@ -166,7 +171,8 @@ pub fn render_merged(
     }
 
     let mut y = 0;
-    for pixmap in pixmaps {
+    for page in document.pages() {
+        let pixmap = render(page, opts);
         canvas.draw_pixmap(
             0,
             y as i32,
