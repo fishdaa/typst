@@ -12,7 +12,7 @@ use typst_library::visualize::{
     ExchangeFormat, Image, ImageKind, ImageScaling, PdfImage, RasterFormat,
 };
 
-use crate::write::{SvgElem, SvgTransform, SvgWrite};
+use crate::write::{SvgElem, SvgIdRef, SvgTransform, SvgWrite};
 use crate::{SVGRenderer, State};
 
 impl SVGRenderer<'_> {
@@ -24,15 +24,19 @@ impl SVGRenderer<'_> {
         image: &Image,
         size: &Axes<Abs>,
     ) {
-        let url = WebImage::new(image).to_base64_url();
-        let mut svg = svg.elem("image");
+        let web_image = WebImage::new(image);
+        let id = self.images.insert_with(web_image.clone(), || web_image);
+
+        let mut svg = svg.elem("use");
         if !state.transform.is_identity() {
             svg.attr("transform", SvgTransform(state.transform));
         }
-        svg.attr("xlink:href", url.as_str());
+        // Writing the href attribute to the "source" image.
+        svg.attr("href", SvgIdRef(id));
+        // Also writing the xlink:href attribute for compatibility.
+        svg.attr("xlink:href", SvgIdRef(id));
         svg.attr("width", size.x.to_pt());
         svg.attr("height", size.y.to_pt());
-        svg.attr("preserveAspectRatio", "none");
         if let Some(value) = convert_image_scaling(image.scaling()) {
             svg.attr_with("style", |attr| {
                 attr.push_str("image-rendering: ");
