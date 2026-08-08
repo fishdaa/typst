@@ -110,16 +110,15 @@ fn try_blit_opaque(
     }
 
     let ImageKind::Raster(raster) = image.kind() else { return None };
-    let dynamic = raster.dynamic();
 
     // Without an alpha channel, every pixel is fully opaque, so overwriting
     // is always correct regardless of what's beneath.
-    if dynamic.color().has_alpha() {
+    if raster.has_alpha() {
         return None;
     }
 
-    let src_w = dynamic.width();
-    let src_h = dynamic.height();
+    let src_w = raster.width();
+    let src_h = raster.height();
 
     // Compute the destination pixel rect and require it to land exactly on
     // the pixel grid at the image's native resolution (i.e. no resampling
@@ -163,18 +162,41 @@ fn try_blit_opaque(
     }
 
     let canvas_w = canvas.width() as usize;
-    let pixels = canvas.pixels_mut();
 
     // Source-space row/column range that maps into the clipped destination
     // rect (still a 1:1 mapping, since we required native resolution above).
     let src_y_range = (clip_y0 - dst_y0) as u32..(clip_y1 - dst_y0) as u32;
     let src_x_range = (clip_x0 - dst_x0) as u32..(clip_x1 - dst_x0) as u32;
-    for sy in src_y_range {
-        let py = (dst_y0 + sy as i64) as usize;
-        for sx in src_x_range.clone() {
-            let px = (dst_x0 + sx as i64) as usize;
-            let Rgba([r, g, b, _]) = dynamic.get_pixel(sx, sy);
-            pixels[py * canvas_w + px] = sk::ColorU8::from_rgba(r, g, b, 255).premultiply();
+
+    // Try to decode just the rows this band/canvas actually needs, so a
+    // full-page-sized source image never has to be fully decoded and held
+    // in memory at once (see `RasterImage::decode_rgba_row_range`). Falls
+    // back to the fully decoded image when the source doesn't qualify
+    // (not PNG, interlaced, EXIF-rotated, etc.).
+    if let Some(rows) = raster.decode_rgba_row_range(src_y_range.start, src_y_range.end) {
+        let pixels = canvas.pixels_mut();
+        for sy in src_y_range.clone() {
+            let py = (dst_y0 + sy as i64) as usize;
+            let row_off = (sy - src_y_range.start) as usize * src_w as usize * 4;
+            for sx in src_x_range.clone() {
+                let px = (dst_x0 + sx as i64) as usize;
+                let idx = row_off + sx as usize * 4;
+                let (r, g, b) = (rows[idx], rows[idx + 1], rows[idx + 2]);
+                pixels[py * canvas_w + px] =
+                    sk::ColorU8::from_rgba(r, g, b, 255).premultiply();
+            }
+        }
+    } else {
+        let dynamic = raster.dynamic();
+        let pixels = canvas.pixels_mut();
+        for sy in src_y_range {
+            let py = (dst_y0 + sy as i64) as usize;
+            for sx in src_x_range.clone() {
+                let px = (dst_x0 + sx as i64) as usize;
+                let Rgba([r, g, b, _]) = dynamic.get_pixel(sx, sy);
+                pixels[py * canvas_w + px] =
+                    sk::ColorU8::from_rgba(r, g, b, 255).premultiply();
+            }
         }
     }
 
@@ -217,8 +239,7 @@ fn try_blit_resized_axis_aligned(
     }
 
     let ImageKind::Raster(raster) = image.kind() else { return None };
-    let dynamic = raster.dynamic();
-    let (src_w, src_h) = (dynamic.width(), dynamic.height());
+    let (src_w, src_h) = (raster.width(), raster.height());
 
     // Compute the destination pixel rect and require it to land exactly on
     // the pixel grid, so tiles can be copied into the canvas without needing
@@ -301,12 +322,48 @@ fn try_blit_resized_axis_aligned(
     let crop_width = crop_w as f64 * scale_x;
     let crop_height = crop_h as f64 * scale_y;
 
-    let src = to_rgba8(image)?;
+    // Try to decode only the source rows this crop actually needs, so a
+    // full-page-sized source image never has to be fully decoded and held
+    // in memory at once (see `RasterImage::decode_rgba_row_range`). Falls
+    // back to the fully decoded, fully converted buffer when the source
+    // doesn't qualify (not PNG, interlaced, EXIF-rotated, etc.).
+    fn rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| {
+                    l.strip_prefix("VmRSS:")
+                        .and_then(|v| v.trim().split_whitespace().next())
+                        .and_then(|v| v.parse().ok())
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    let row_lo = crop_top.floor().max(0.0) as u32;
+    let row_hi = (crop_top + crop_height).ceil().min(src_h as f64) as u32;
     let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
-    let opts = ResizeOptions::new()
-        .resize_alg(alg)
-        .crop(crop_left, crop_top, crop_width, crop_height);
-    Resizer::new().resize(src.as_ref(), &mut resized, &opts).ok()?;
+    let opts = ResizeOptions::new().resize_alg(alg);
+    eprintln!(
+        "DEBUG resized_axis_aligned row_lo={row_lo} row_hi={row_hi} src_h={src_h} crop_w={crop_w} crop_h={crop_h} rss_before={}kB",
+        rss_kb()
+    );
+    if let Some(region) = raster.decode_rgba_row_range(row_lo, row_hi) {
+        eprintln!("DEBUG   -> row_range path taken, rss_after_decode={}kB", rss_kb());
+        let region_h = row_hi - row_lo;
+        let region_img =
+            FirImage::from_vec_u8(src_w, region_h, region, PixelType::U8x4).ok()?;
+        let opts =
+            opts.crop(crop_left, crop_top - row_lo as f64, crop_width, crop_height);
+        Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
+        eprintln!("DEBUG   -> rss_after_resize={}kB", rss_kb());
+    } else {
+        eprintln!("DEBUG   -> FALLBACK full-decode path taken");
+        let src = to_rgba8(image)?;
+        let opts = opts.crop(crop_left, crop_top, crop_width, crop_height);
+        Resizer::new().resize(src.as_ref(), &mut resized, &opts).ok()?;
+    }
+    eprintln!("DEBUG   -> rss_end_of_fn={}kB", rss_kb());
 
     let (tile_w, tile_h) = ((clip_x1 - clip_x0) as u32, (clip_y1 - clip_y0) as u32);
     let mut tile = sk::Pixmap::new(tile_w, tile_h)?;
