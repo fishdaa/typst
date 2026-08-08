@@ -54,6 +54,7 @@ pub mod diagnostics;
 pub mod downloader;
 pub mod files;
 pub mod fonts;
+mod mmap;
 pub mod packages;
 pub mod server;
 pub mod timer;

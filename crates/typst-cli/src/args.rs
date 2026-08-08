@@ -362,6 +362,20 @@ pub struct CompileArgs {
     #[arg(long = "png-compression", default_value_t)]
     pub png_compression: PngCompression,
 
+    /// Caps peak memory used while rendering a page to PNG, in mebibytes.
+    ///
+    /// When set, the page is rendered and encoded in horizontal bands sized
+    /// to fit this budget, and encoded PNG data is evicted from the OS page
+    /// cache once written to disk on a matching schedule -- both derived
+    /// from the requested limit instead of a fixed constant, so the same
+    /// flag value caps memory the same way regardless of the page's size,
+    /// PPI, or the resolution of any background images. Lower values trade
+    /// some render/encode speed (more, smaller bands; more frequent disk
+    /// syncs) for a smaller memory footprint. Unset uses a fixed built-in
+    /// budget tuned for typical documents.
+    #[arg(long = "max-memory", value_name = "MEBIBYTES")]
+    pub max_memory: Option<u64>,
+
     /// File path to which a Makefile with the current compilation's
     /// dependencies will be written.
     #[clap(long = "make-deps", value_name = "PATH", hide = true)]

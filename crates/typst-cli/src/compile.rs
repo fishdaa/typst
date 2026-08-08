@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
@@ -83,6 +83,9 @@ pub struct CompileConfig {
     pub ppi: f64,
     /// The compression effort to use for PNG export.
     pub png_compression: PngCompression,
+    /// Caps peak memory used while rendering a page to PNG, in mebibytes.
+    /// `None` uses a fixed built-in budget. See `CompileArgs::max_memory`.
+    pub max_memory: Option<u64>,
     /// The export cache for images, used for caching output files in `typst
     /// watch` sessions with images.
     pub export_cache: ExportCache,
@@ -244,6 +247,7 @@ impl CompileConfig {
                 .transpose()?,
             ppi: args.ppi,
             png_compression: args.png_compression,
+            max_memory: args.max_memory,
             diagnostic_format: args.process.diagnostic_format,
             open: args.open.clone(),
             export_cache: ExportCache::new(),
@@ -580,6 +584,7 @@ fn export_image_page(
                 page,
                 &options,
                 config.png_compression,
+                config.max_memory,
                 output,
             )
             .map_err(|err| eco_format!("failed to encode PNG file ({err})"))?;
@@ -595,11 +600,113 @@ fn export_image_page(
     Ok(())
 }
 
-/// The largest amount of raw pixel data (RGBA8) to materialize for one band
-/// when rendering a page in bands. Keeps memory bounded regardless of page
-/// size: e.g. at a poster's width (~7200px) this yields bands of roughly
+/// The default per-band byte budget and page-cache eviction interval, used
+/// when `--max-memory` isn't given. Tuned for typical documents: e.g. at a
+/// poster's width (~7200px) `DEFAULT_MAX_BAND_BYTES` yields bands of roughly
 /// 500 rows.
-const MAX_BAND_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_BAND_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_EVICT_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+
+/// A rough allowance for peak memory `--max-memory` doesn't control: the
+/// in-memory document model, font/glyph caches, and other per-process
+/// overhead that exists regardless of how small banding is made. Without
+/// this, a tight `--max-memory` value would ask for band/eviction sizes far
+/// below what's actually achievable, without making the result any smaller.
+const BASE_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Derives the per-band byte budget and page-cache eviction interval (see
+/// `EvictingFileWriter`) from a user-specified memory cap in mebibytes, so
+/// the same flag value scales both to fit *any* document -- rather than
+/// hardcoding a band size that happens to work for one particular page size
+/// or asset resolution. Falls back to fixed defaults when no cap is given.
+///
+/// This is a heuristic, not an exact guarantee -- see `BASE_OVERHEAD_BYTES`.
+/// A band's raw canvas, its demultiplied copy, and the source image's
+/// row-range decode buffer (`RasterImage::decode_rgba_row_range`) can all be
+/// alive at once, so the remaining budget is divided across roughly that
+/// many same-order buffers, plus headroom for the eviction interval.
+fn band_budget(max_memory_mib: Option<u64>) -> (usize, u64) {
+    let Some(mib) = max_memory_mib else {
+        return (DEFAULT_MAX_BAND_BYTES, DEFAULT_EVICT_CHUNK_BYTES);
+    };
+    let budget = mib.saturating_mul(1024 * 1024).saturating_sub(BASE_OVERHEAD_BYTES);
+    let band_bytes = ((budget / 6) as usize).max(4096);
+    let evict_bytes = (budget / 4).clamp(1024 * 1024, 128 * 1024 * 1024);
+    (band_bytes, evict_bytes)
+}
+
+/// Wraps a plain file (not stdout, which may be a pipe or terminal rather
+/// than a normal file) so that once `evict_chunk_bytes` have been written,
+/// they're synced to disk and the OS is told to drop them from the page
+/// cache.
+///
+/// Without this, writing a large encoded PNG (a high-DPI poster can run to
+/// hundreds of megabytes or more) leaves all of it resident as dirty (then
+/// clean) page cache by the time the export finishes. A memory-constrained
+/// cgroup charges page cache the same as heap memory, so that cache would
+/// otherwise dominate peak memory regardless of how small
+/// `render_and_encode_png_in_bands` keeps the actual render/encode buffers.
+struct EvictingFileWriter {
+    file: std::fs::File,
+    evict_chunk_bytes: u64,
+    written: u64,
+    evicted: u64,
+}
+
+impl EvictingFileWriter {
+    fn create(path: &Path, evict_chunk_bytes: u64) -> io::Result<Self> {
+        Ok(Self {
+            file: std::fs::File::create(path)?,
+            evict_chunk_bytes,
+            written: 0,
+            evicted: 0,
+        })
+    }
+
+    /// Syncs and evicts everything written so far. Best-effort: an error
+    /// (or running on a platform without `posix_fadvise`) just leaves the
+    /// data cached, which is the pre-existing behavior, not a correctness
+    /// problem.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn evict_written(&mut self) {
+        use std::os::unix::io::AsRawFd;
+
+        if self.file.sync_data().is_err() {
+            return;
+        }
+
+        // SAFETY: `self.file` is a valid, open file descriptor for the
+        // duration of this call. `posix_fadvise` only affects the OS page
+        // cache, never the file's contents or Rust-level memory safety.
+        unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                0,
+                self.written as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+        self.evicted = self.written;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn evict_written(&mut self) {}
+}
+
+impl Write for EvictingFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        if self.written - self.evicted >= self.evict_chunk_bytes {
+            self.evict_written();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
 
 /// Renders a page and encodes it as a PNG, honoring the configured
 /// compression effort, without ever materializing the full-page canvas --
@@ -622,7 +729,34 @@ fn render_and_encode_png_in_bands(
     page: &Page,
     opts: &RenderOptions,
     compression: PngCompression,
+    max_memory_mib: Option<u64>,
     output: &Output,
+) -> Result<(), png::EncodingError> {
+    let (band_bytes, evict_bytes) = band_budget(max_memory_mib);
+
+    // A plain file gets the page-cache-evicting writer (see
+    // `EvictingFileWriter`); stdout may be a pipe or terminal rather than a
+    // regular file, so it's written as-is.
+    match output {
+        Output::Path(path) => encode_bands(
+            page,
+            opts,
+            compression,
+            band_bytes,
+            EvictingFileWriter::create(path, evict_bytes)?,
+        ),
+        Output::Stdout => encode_bands(page, opts, compression, band_bytes, output.open()?),
+    }
+}
+
+/// Does the actual banded render + PNG encode into `out`, shared between
+/// [`render_and_encode_png_in_bands`]'s file and stdout cases.
+fn encode_bands(
+    page: &Page,
+    opts: &RenderOptions,
+    compression: PngCompression,
+    max_band_bytes: usize,
+    mut out: impl Write,
 ) -> Result<(), png::EncodingError> {
     let (width, height) = typst_render::pixel_dimensions(page, opts);
     let row_bytes = (width as usize).saturating_mul(4).max(1);
@@ -632,10 +766,9 @@ fn render_and_encode_png_in_bands(
         // a single band (the whole page), matching un-banded behavior.
         height.max(1)
     } else {
-        ((MAX_BAND_BYTES / row_bytes) as u32).clamp(1, height.max(1))
+        ((max_band_bytes / row_bytes) as u32).clamp(1, height.max(1))
     };
 
-    let mut out = output.open()?;
     let mut encoder = png::Encoder::new(&mut out, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
@@ -819,5 +952,34 @@ impl From<PdfStandard> for typst_pdf::PdfStandard {
             PdfStandard::A_4e => typst_pdf::PdfStandard::A_4e,
             PdfStandard::UA_1 => typst_pdf::PdfStandard::Ua_1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `band_budget` derives byte budgets purely from the memory cap, not
+    /// from any page/asset dimensions, so the same `--max-memory` value
+    /// scales down banding for a huge poster exactly like it would for a
+    /// tiny page: `band_rows = band_bytes / row_bytes` then adapts to
+    /// whatever `row_bytes` (i.e. page width) turns out to be.
+    #[test]
+    fn test_band_budget_scales_with_cap_not_content() {
+        let (default_band, default_evict) = band_budget(None);
+        assert_eq!(default_band, DEFAULT_MAX_BAND_BYTES);
+        assert_eq!(default_evict, DEFAULT_EVICT_CHUNK_BYTES);
+
+        let (small_band, small_evict) = band_budget(Some(128));
+        let (large_band, large_evict) = band_budget(Some(2048));
+        assert!(small_band < large_band, "{small_band} should be < {large_band}");
+        assert!(small_evict < large_evict, "{small_evict} should be < {large_evict}");
+
+        // A cap at or below the base overhead allowance still yields a
+        // usable (if minimal) band -- at least one row -- rather than
+        // zero/underflowing.
+        let (floor_band, floor_evict) = band_budget(Some(1));
+        assert!(floor_band > 0);
+        assert!(floor_evict > 0);
     }
 }

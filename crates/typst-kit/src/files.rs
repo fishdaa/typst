@@ -358,6 +358,19 @@ impl FsRoot {
     }
 
     /// Loads file data from the given virtual path in this root.
+    ///
+    /// Large files are memory-mapped rather than copied into the heap (see
+    /// [`crate::mmap`]), so their pages can be reclaimed by the OS under
+    /// memory pressure instead of being pinned for the whole compilation.
+    /// This trades away one guarantee a plain read has: truncating or
+    /// overwriting such a file in place (same inode) while it's still
+    /// mapped and being read can crash the process, instead of the read
+    /// simply seeing old or new (but still valid) content. This is a narrow
+    /// risk in practice -- it requires in-place mutation of a large file
+    /// racing a concurrent read of that same file -- and editors/build
+    /// tools overwhelmingly save via atomic rename, which isn't affected
+    /// (the old mapping is over an unlinked inode, already dropped by the
+    /// time a new one is read).
     pub fn load(&self, path: &VirtualPath) -> FileResult<Bytes> {
         // Join the path to the root. If it tries to escape, deny access. Note:
         // It can still escape via symlinks.
@@ -366,7 +379,7 @@ impl FsRoot {
         if fs::metadata(&path).map_err(f)?.is_dir() {
             Err(FileError::IsDirectory)
         } else {
-            fs::read(&path).map(Bytes::new).map_err(f)
+            crate::mmap::read_file(&path).map_err(f)
         }
     }
 }
@@ -462,6 +475,66 @@ mod tests {
         // finally gets dropped.
         store.reset();
         assert_eq!(store.slots.lock().len(), 1);
+    }
+
+    /// `FsRoot::load` goes through `crate::mmap::read_file` (see that
+    /// module's own unit tests for the threshold/fallback logic in
+    /// isolation) -- these exercise it end-to-end via real files on disk,
+    /// including the below/above-mmap-threshold boundary and the existing
+    /// directory-rejection behavior.
+    mod fs_root {
+        use std::fs;
+
+        use super::*;
+
+        fn root(dir: &std::path::Path) -> FsRoot {
+            FsRoot::new(dir.to_path_buf())
+        }
+
+        fn vpath(name: &str) -> VirtualPath {
+            VirtualPath::new(name).unwrap()
+        }
+
+        #[test]
+        fn test_fs_root_load_small_file() {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("small.txt"), "hello").unwrap();
+            let bytes = root(dir.path()).load(&vpath("small.txt")).unwrap();
+            assert_eq!(bytes.as_slice(), b"hello");
+        }
+
+        #[test]
+        fn test_fs_root_load_large_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let content = vec![0x17u8; 2 * 1024 * 1024];
+            fs::write(dir.path().join("large.bin"), &content).unwrap();
+            let bytes = root(dir.path()).load(&vpath("large.bin")).unwrap();
+            assert_eq!(bytes.as_slice(), content.as_slice());
+        }
+
+        #[test]
+        fn test_fs_root_load_empty_file() {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("empty.bin"), []).unwrap();
+            let bytes = root(dir.path()).load(&vpath("empty.bin")).unwrap();
+            assert_eq!(bytes.as_slice(), b"");
+        }
+
+        #[test]
+        fn test_fs_root_load_missing_file() {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(root(dir.path()).load(&vpath("missing.bin")).is_err());
+        }
+
+        #[test]
+        fn test_fs_root_load_directory_is_rejected() {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir(dir.path().join("subdir")).unwrap();
+            assert_eq!(
+                root(dir.path()).load(&vpath("subdir")),
+                Err(FileError::IsDirectory)
+            );
+        }
     }
 
     const A_TEXT: &str = "Hello from A";

@@ -26,6 +26,7 @@ fastrand = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 fontdb = { workspace = true, optional = true }
 infer = { workspace = true, optional = true }
+memmap2 = { workspace = true }
 native-tls = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
 once_cell = { workspace = true }
@@ -90,6 +91,9 @@ http-server = ["dep:tiny_http", "dep:infer", "dep:percent-encoding"]
 # Whether to vendor OpenSSL for the `system-downloader`. Not applicable to
 # Windows and macOS build.
 vendor-openssl = ["openssl/vendored"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
