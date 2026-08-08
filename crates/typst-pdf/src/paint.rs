@@ -172,27 +172,40 @@ fn convert_pattern(
     let transform = correct_transform(state, pattern.unwrap_relative(on_text))
         .pre_concat(Transform::translate(pattern.offset().x, pattern.offset().y));
 
-    let mut stream_builder = surface.stream_builder();
-    let mut surface = stream_builder.surface();
-    tags::tiling(gc, &mut surface, pattern.size(), |gc, surface| {
-        let mut fc = FrameContext::new(None, pattern.frame().size());
-        handle_frame(
-            &mut fc,
-            pattern.frame(),
-            Sides::splat(Abs::zero()),
-            None,
-            surface,
-            gc,
-        )
-    })?;
-    surface.finish();
-    let stream = stream_builder.finish();
-    let pattern = Pattern {
-        stream,
-        transform: transform.to_krilla(),
-        width: (pattern.size().x + pattern.spacing().x).to_pt() as _,
-        height: (pattern.size().y + pattern.spacing().y).to_pt() as _,
+    // Rendering the pattern's content stream means walking its whole frame
+    // (`handle_frame`), which can be arbitrarily expensive; cache the result
+    // by the tiling's content so that reusing the same tiling on many shapes
+    // or glyphs (e.g. a hatched table) only pays for it once. This is safe
+    // to reuse across call sites within the same document: any fonts/other
+    // resources `handle_frame` registers into `gc` persist for the whole
+    // document, regardless of which call caused the registration, and
+    // krilla's `Stream`/`Pattern` are explicitly designed to be cloned and
+    // reused this way.
+    let (stream, width, height) = if let Some(cached) = gc.tiling_cache.get(pattern) {
+        cached.clone()
+    } else {
+        let mut stream_builder = surface.stream_builder();
+        let mut surface = stream_builder.surface();
+        tags::tiling(gc, &mut surface, pattern.size(), |gc, surface| {
+            let mut fc = FrameContext::new(None, pattern.frame().size());
+            handle_frame(
+                &mut fc,
+                pattern.frame(),
+                Sides::splat(Abs::zero()),
+                None,
+                surface,
+                gc,
+            )
+        })?;
+        surface.finish();
+        let stream = stream_builder.finish();
+        let width = (pattern.size().x + pattern.spacing().x).to_pt() as _;
+        let height = (pattern.size().y + pattern.spacing().y).to_pt() as _;
+        gc.tiling_cache.insert(pattern.clone(), (stream.clone(), width, height));
+        (stream, width, height)
     };
+
+    let pattern = Pattern { stream, transform: transform.to_krilla(), width, height };
 
     Ok((pattern.into(), 255))
 }

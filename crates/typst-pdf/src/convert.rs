@@ -26,7 +26,7 @@ use typst_library::introspection::{Introspector, Location, PagedPosition, Tag};
 use typst_library::layout::{Abs, Frame, FrameItem, GroupItem, Sides, Size, Transform};
 use typst_library::model::{HeadingElem, LateLinkResolver};
 use typst_library::text::FontInstance;
-use typst_library::visualize::{Geometry, Paint, SpotColorantName};
+use typst_library::visualize::{Geometry, Paint, SpotColorantName, Tiling};
 use typst_syntax::Span;
 
 use crate::PdfOptions;
@@ -298,6 +298,11 @@ pub(crate) struct GlobalContext<'a> {
     pub(crate) page_index_converter: PageIndexConverter,
     /// Tagged PDF context.
     pub(crate) tags: Tags,
+    /// Cache of rendered tiling pattern content streams, keyed by the
+    /// tiling's content. Without this, every shape or glyph filled with the
+    /// same tiling pattern re-renders that pattern's whole frame from
+    /// scratch (see `convert_pattern` in `paint.rs`).
+    pub(crate) tiling_cache: FxHashMap<Tiling, (krilla::stream::Stream, f32, f32)>,
 }
 
 impl<'a> GlobalContext<'a> {
@@ -320,6 +325,7 @@ impl<'a> GlobalContext<'a> {
             image_spans: FxHashSet::default(),
             page_index_converter,
             tags,
+            tiling_cache: FxHashMap::default(),
         }
     }
 }
