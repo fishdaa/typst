@@ -305,7 +305,10 @@ pub fn render_tiling_frame(state: &State, tilings: &Tiling) -> Arc<sk::Pixmap> {
 /// pattern re-rendered that frame from scratch -- e.g. a hatched table with
 /// many cells sharing one tiling pattern would redo this work per cell.
 #[comemo::memoize]
-fn render_tiling_frame_cached(tilings: &Tiling, pixel_per_pt_bits: u32) -> Arc<sk::Pixmap> {
+fn render_tiling_frame_cached(
+    tilings: &Tiling,
+    pixel_per_pt_bits: u32,
+) -> Arc<sk::Pixmap> {
     let pixel_per_pt = f32::from_bits(pixel_per_pt_bits);
     let size = tilings.size() + tilings.spacing();
     let mut canvas = sk::Pixmap::new(

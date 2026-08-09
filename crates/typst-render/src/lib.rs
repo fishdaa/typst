@@ -159,8 +159,11 @@ pub fn render_merged(
     // page's full canvas in memory just to find their sizes. Pages are then
     // rendered and drawn one at a time below, so at most one page's canvas
     // (rather than every page's) is resident alongside the merged canvas.
-    let sizes: Vec<(u32, u32)> =
-        document.pages().iter().map(|page| pixel_dimensions(page, opts)).collect();
+    let sizes: Vec<(u32, u32)> = document
+        .pages()
+        .iter()
+        .map(|page| pixel_dimensions(page, opts))
+        .collect();
     let pxw = sizes.iter().map(|&(w, _)| w).max().unwrap_or_default();
     let pxh = sizes.iter().map(|&(_, h)| h).sum::<u32>()
         + gap * sizes.len().saturating_sub(1) as u32;

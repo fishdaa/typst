@@ -236,9 +236,10 @@ fn derive_channels(raster: &RasterImage) -> Channels {
             } else {
                 ColorBuf::Owned(dynamic.to_luma8().into_raw())
             };
-            let alpha = dynamic.color().has_alpha().then(|| {
-                dynamic.pixels().map(|(_, _, Rgba([_, _, _, a]))| a).collect()
-            });
+            let alpha = dynamic
+                .color()
+                .has_alpha()
+                .then(|| dynamic.pixels().map(|(_, _, Rgba([_, _, _, a]))| a).collect());
             Channels { color, is_rgb, alpha, icc_valid: false }
         }
     }
@@ -271,7 +272,10 @@ impl CustomImage for PdfRasterImage {
 
     fn icc_profile(&self) -> Option<&[u8]> {
         let channels = self.0.channels.get_or_init(|| derive_channels(&self.0.raster));
-        channels.icc_valid.then(|| self.0.raster.icc().map(|b| b.as_bytes())).flatten()
+        channels
+            .icc_valid
+            .then(|| self.0.raster.icc().map(|b| b.as_bytes()))
+            .flatten()
     }
 
     fn color_space(&self) -> ImageColorspace {
@@ -306,7 +310,8 @@ fn convert_raster(
         // serialization. The custom-image path below decodes the whole image
         // and retains separate color/alpha buffers, which is unnecessarily
         // expensive for a PNG that krilla can embed directly.
-        let image_data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(raster.data().clone());
+        let image_data: Arc<dyn AsRef<[u8]> + Send + Sync> =
+            Arc::new(raster.data().clone());
         krilla::image::Image::from_png(image_data.into(), interpolate)
     } else {
         krilla::image::Image::from_custom(PdfRasterImage::new(raster), interpolate)

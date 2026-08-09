@@ -360,5 +360,4 @@ mod tests {
         assert_eq!(format!("{}", FontStretch(1120)), "112%");
         assert_eq!(format!("{}", FontStretch(u16::MAX)), "6553.5%");
     }
-
 }

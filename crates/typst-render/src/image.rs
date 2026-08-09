@@ -701,7 +701,8 @@ fn try_blit_resized_general(
 
     let region = raster.decode_rgba_row_range(row_lo, row_hi)?;
     let region_h = row_hi - row_lo;
-    let region_img = FirImage::from_vec_u8(src_w, region_h, region, PixelType::U8x4).ok()?;
+    let region_img =
+        FirImage::from_vec_u8(src_w, region_h, region, PixelType::U8x4).ok()?;
 
     // See the matching comment in `try_blit_resized_axis_aligned`: the
     // nominal crop rect can extend past what was actually decoded at the
@@ -711,9 +712,12 @@ fn try_blit_resized_general(
     let crop_width = crop_width.min(src_w as f64 - crop_left);
 
     let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
-    let opts = ResizeOptions::new()
-        .resize_alg(alg)
-        .crop(crop_left, local_crop_top, crop_width, crop_height);
+    let opts = ResizeOptions::new().resize_alg(alg).crop(
+        crop_left,
+        local_crop_top,
+        crop_width,
+        crop_height,
+    );
     Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
 
     let mut tile = sk::Pixmap::new(crop_w, crop_h)?;

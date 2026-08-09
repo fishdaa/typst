@@ -44,10 +44,8 @@ pub(crate) fn handle_shape(
             None
         };
 
-        let stroke = shape
-            .stroke
-            .as_ref()
-            .filter(|stroke| stroke.thickness.to_f32() > 0.0);
+        let stroke =
+            shape.stroke.as_ref().filter(|stroke| stroke.thickness.to_f32() > 0.0);
 
         let stroke = if let Some(stroke) = &stroke {
             let stroke = paint::convert_stroke(
