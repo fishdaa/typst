@@ -3526,6 +3526,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "typst-bench"
+version = "0.15.1"
+dependencies = [
+ "libc",
+ "png",
+ "tempfile",
+]
+
+[[package]]
 name = "typst-bundle"
 version = "0.15.1"
 dependencies = [
