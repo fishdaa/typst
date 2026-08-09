@@ -133,7 +133,7 @@ impl RasterImage {
 
                 let (mut width, mut height) = (raw_w, raw_h);
                 if let Some(rotation) = exif.as_ref().and_then(exif_rotation) {
-                    if matches!(rotation, 5 | 6 | 7 | 8) {
+                    if matches!(rotation, 5..=8) {
                         std::mem::swap(&mut width, &mut height);
                     }
                     exif_rot = Some(rotation);
@@ -417,7 +417,7 @@ impl RasterImage {
             return Some(Vec::new());
         }
 
-        let mut out = vec![0u8; width as usize * (y1 - y0) as usize * 4];
+        let mut out = vec![0_u8; width as usize * (y1 - y0) as usize * 4];
         while next_row < y1 {
             let Some(data) = reader.next_row().ok()? else { break };
             if next_row >= y0 {
