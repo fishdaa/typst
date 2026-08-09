@@ -55,6 +55,10 @@ struct RowCursor {
     next_row: u32,
     width: u32,
     channels: u8,
+    /// Bytes per channel sample in the *source* row data `next_row()`
+    /// hands back (1 for 8-bit, 2 for 16-bit). The decoded output is
+    /// always tightly packed RGBA8 regardless of this value.
+    bytes_per_sample: u8,
 }
 
 impl RowCursor {
@@ -70,15 +74,14 @@ impl RowCursor {
             info.width
         };
         let (color_type, bit_depth) = reader.output_color_type();
-        if bit_depth != png::BitDepth::Eight {
-            return None;
-        }
-        let channels = match color_type {
-            png::ColorType::Rgb => 3,
-            png::ColorType::Rgba => 4,
+        let (bytes_per_sample, channels) = match (bit_depth, color_type) {
+            (png::BitDepth::Eight, png::ColorType::Rgb) => (1, 3),
+            (png::BitDepth::Eight, png::ColorType::Rgba) => (1, 4),
+            (png::BitDepth::Sixteen, png::ColorType::Rgb) => (2, 3),
+            (png::BitDepth::Sixteen, png::ColorType::Rgba) => (2, 4),
             _ => return None,
         };
-        Some(Self { reader, next_row: 0, width, channels })
+        Some(Self { reader, next_row: 0, width, channels, bytes_per_sample })
     }
 }
 
@@ -345,8 +348,8 @@ impl RasterImage {
     /// materializing the whole decoded image.
     ///
     /// Returns `None` if the image doesn't qualify for this fast path --
-    /// only non-interlaced, 8-bit-per-channel RGB/RGBA PNGs with no
-    /// EXIF-driven rotation do. Callers should fall back to
+    /// only non-interlaced 8-bit- or 16-bit-per-channel RGB/RGBA PNGs with
+    /// no EXIF-driven rotation do. Callers should fall back to
     /// [`Self::dynamic`] in that case.
     ///
     /// This is meant for band-aware rendering of a large raster image
@@ -373,12 +376,14 @@ impl RasterImage {
             Some(cursor) if cursor.next_row <= y0 => cursor,
             _ => RowCursor::new(&self.0.data)?,
         };
-        let RowCursor { mut reader, mut next_row, width, channels } = cursor;
+        let RowCursor { mut reader, mut next_row, width, channels, bytes_per_sample } =
+            cursor;
 
         let height = reader.info().height;
         let y1 = y1.min(height);
         if y0 >= y1 {
-            *guard = Some(RowCursor { reader, next_row, width, channels });
+            *guard =
+                Some(RowCursor { reader, next_row, width, channels, bytes_per_sample });
             return Some(Vec::new());
         }
 
@@ -388,21 +393,42 @@ impl RasterImage {
             if next_row >= y0 {
                 let start = (next_row - y0) as usize * width as usize * 4;
                 let dest = &mut out[start..start + width as usize * 4];
-                if channels == 4 {
-                    dest.copy_from_slice(data.data());
-                } else {
-                    for (src, dst) in
-                        data.data().chunks_exact(3).zip(dest.chunks_exact_mut(4))
-                    {
-                        dst[..3].copy_from_slice(src);
-                        dst[3] = 255;
+                match (bytes_per_sample, channels) {
+                    (1, 4) => dest.copy_from_slice(data.data()),
+                    (1, 3) => {
+                        for (src, dst) in
+                            data.data().chunks_exact(3).zip(dest.chunks_exact_mut(4))
+                        {
+                            dst[..3].copy_from_slice(src);
+                            dst[3] = 255;
+                        }
                     }
+                    (2, 4) => {
+                        for (src, dst) in
+                            data.data().chunks_exact(8).zip(dest.chunks_exact_mut(4))
+                        {
+                            for i in 0..4 {
+                                dst[i] = sample16_to_8(src[i * 2], src[i * 2 + 1]);
+                            }
+                        }
+                    }
+                    (2, 3) => {
+                        for (src, dst) in
+                            data.data().chunks_exact(6).zip(dest.chunks_exact_mut(4))
+                        {
+                            for i in 0..3 {
+                                dst[i] = sample16_to_8(src[i * 2], src[i * 2 + 1]);
+                            }
+                            dst[3] = 255;
+                        }
+                    }
+                    _ => unreachable!("RowCursor::new only yields these combinations"),
                 }
             }
             next_row += 1;
         }
 
-        *guard = Some(RowCursor { reader, next_row, width, channels });
+        *guard = Some(RowCursor { reader, next_row, width, channels, bytes_per_sample });
         Some(out)
     }
 }
@@ -551,6 +577,18 @@ fn png_reader(
     let mut decoder = png::Decoder::new(io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::EXPAND);
     decoder.read_info()
+}
+
+/// Converts a big-endian 16-bit PNG channel sample to 8 bits, matching
+/// `image`'s own `FromPrimitive<u16> for u8` exactly (`(v * 255 + 127.5) /
+/// 65535` rounded to nearest, computed here as `(v + 128) / 257` in integer
+/// arithmetic) so [`RasterImage::decode_rgba_row_range`]'s output stays
+/// byte-identical to [`RasterImage::dynamic`]`().to_rgba8()`. This is *not*
+/// `(v >> 8) as u8` -- that truncates instead of rounding and would produce
+/// different output for roughly half of all input values.
+fn sample16_to_8(hi: u8, lo: u8) -> u8 {
+    let v = u16::from_be_bytes([hi, lo]) as u32;
+    ((v + 128) / 257) as u8
 }
 
 /// Reads a PNG's header and validates that the rest of the image data
@@ -785,6 +823,89 @@ mod tests {
         test("images/small.png"); // palette -> expanded to RGB(A) by EXPAND
     }
 
+    /// Encodes a small in-memory PNG with varied, non-trivial 16-bit sample
+    /// values (not just 0/max), to exercise `sample16_to_8`'s rounding
+    /// across its range rather than only its endpoints.
+    fn encode_png16(width: u32, height: u32, color_type: png::ColorType) -> Vec<u8> {
+        let channels = match color_type {
+            png::ColorType::Rgb => 3,
+            png::ColorType::Rgba => 4,
+            _ => unreachable!("test only uses Rgb/Rgba"),
+        };
+        let mut data = Vec::with_capacity((width * height * channels * 2) as usize);
+        let mut i: u32 = 0;
+        for _ in 0..(width * height * channels) {
+            // A varied, deterministic sequence covering low/mid/high values.
+            let v = ((i.wrapping_mul(2654435761)) % 65536) as u16;
+            data.extend_from_slice(&v.to_be_bytes());
+            i += 1;
+        }
+
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(color_type);
+            encoder.set_depth(png::BitDepth::Sixteen);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&data).unwrap();
+        }
+        out
+    }
+
+    /// The fast path must handle 16-bit PNGs, converting each channel
+    /// sample down to 8 bits with the exact same rounding `image`'s own
+    /// `FromPrimitive<u16> for u8` uses, so output stays byte-identical to
+    /// the full decode.
+    #[test]
+    fn test_row_range_matches_full_decode_16bit() {
+        #[track_caller]
+        fn test(color_type: png::ColorType) {
+            let data = encode_png16(4, 5, color_type);
+            let image = RasterImage::plain(Bytes::new(data), ExchangeFormat::Png)
+                .unwrap_or_else(|err| panic!("{color_type:?}: {err:?}"));
+            let full = image.dynamic().to_rgba8();
+            let width = image.width();
+            let height = image.height();
+
+            let region = image
+                .decode_rgba_row_range(0, height)
+                .unwrap_or_else(|| panic!("expected fast path for {color_type:?}"));
+            assert_eq!(
+                region,
+                &full.as_raw()[..(width * height * 4) as usize],
+                "{color_type:?}"
+            );
+
+            // A mid-image sub-range too, to exercise the row-cursor's
+            // partial-range path, not just the whole-image case.
+            let region = image.decode_rgba_row_range(2, 4).unwrap();
+            let expected = &full.as_raw()
+                [(2 * width * 4) as usize..(4 * width * 4) as usize];
+            assert_eq!(region, expected, "{color_type:?}: rows 2..4");
+        }
+
+        test(png::ColorType::Rgb);
+        test(png::ColorType::Rgba);
+    }
+
+    /// Pins the 16-bit-to-8-bit channel rounding formula independent of a
+    /// full image round-trip: `image`'s own `FromPrimitive<u16> for u8` is
+    /// `round(v * 255 / 65535)`, not `(v >> 8) as u8` truncation.
+    #[test]
+    fn test_sample16_to_8() {
+        assert_eq!(sample16_to_8(0x00, 0x00), 0);
+        assert_eq!(sample16_to_8(0xFF, 0xFF), 255);
+        assert_eq!(sample16_to_8(0x80, 0x00), 128); // 32768 -> 128
+        assert_eq!(sample16_to_8(0x01, 0x00), 1); // 256 -> 1 (agrees with >>8)
+
+        // A value where rounding and truncation genuinely disagree:
+        // 200 -> round(200 * 255 / 65535) = round(0.778) = 1, whereas
+        // truncating `200 >> 8 = 0`. Confirms the formula rounds rather
+        // than truncates, matching `image`'s own conversion exactly.
+        assert_eq!(sample16_to_8(0x00, 0xC8), 1);
+        assert_ne!(sample16_to_8(0x00, 0xC8), (200u16 >> 8) as u8);
+    }
+
     /// Formats/cases the fast path doesn't support must cleanly fall back
     /// (return `None`) rather than produce wrong output.
     #[test]
@@ -798,5 +919,14 @@ mod tests {
         let gray = typst_dev_assets::get("screenshots/3-advanced-paper.png").unwrap();
         let gray = RasterImage::plain(Bytes::new(gray), ExchangeFormat::Png).unwrap();
         assert!(gray.decode_rgba_row_range(0, 1).is_none());
+
+        // Note: an interlaced-PNG case is intentionally not covered here --
+        // the `png` crate's `Writer::write_image_data` doesn't support
+        // writing Adam7-interlaced data (it always lays out `data` as plain
+        // consecutive rows regardless of `Info::interlaced`), so
+        // synthesizing a valid interlaced fixture in-process isn't
+        // straightforward. The qualification check itself
+        // (`RowCursor::new`'s `if info.interlaced { return None }`) is
+        // untouched by this change.
     }
 }

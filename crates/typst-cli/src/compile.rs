@@ -318,6 +318,11 @@ pub fn compile_once(
             .map_err(|err| eco_format!("failed to create dependency file ({err})"))?;
     }
 
+    // Final sweep: PDF/HTML/bundle exports (unlike PNG, see
+    // `export_image_page`) don't trim per-output, so do it once here for the
+    // whole compile.
+    trim_malloc_best_effort();
+
     Ok(())
 }
 
@@ -501,6 +506,14 @@ fn export_image(
         bail!("cannot export multiple images {err}");
     }
 
+    // `exported_pages.par_iter()` below can have this many pages mid-band
+    // simultaneously, so `--max-memory`'s per-page budget (`band_budget`)
+    // must be divided across it to keep the flag's cap meaningful for
+    // multi-page documents. `current_num_threads()` reflects `-j`/`--jobs`
+    // (set via `rayon::ThreadPoolBuilder::build_global` in
+    // `SystemWorld::new`) or the CPU count if unset.
+    let concurrency = rayon::current_num_threads().min(exported_pages.len().max(1));
+
     // The results are collected in a `Vec<()>` which does not allocate.
     exported_pages
         .par_iter()
@@ -535,7 +548,7 @@ fn export_image(
                 Output::Stdout => Output::Stdout,
             };
 
-            export_image_page(config, page, &output, fmt)?;
+            export_image_page(config, page, concurrency, &output, fmt)?;
             Ok(output)
         })
         .collect::<StrResult<Vec<Output>>>()
@@ -574,10 +587,11 @@ mod output_template {
 fn export_image_page(
     config: &CompileConfig,
     page: &Page,
+    concurrency: usize,
     output: &Output,
     fmt: ImageExportFormat,
 ) -> StrResult<()> {
-    match fmt {
+    let result = match fmt {
         ImageExportFormat::Png => {
             let options = png_options(config);
             render_and_encode_png_in_bands(
@@ -585,20 +599,48 @@ fn export_image_page(
                 &options,
                 config.png_compression,
                 config.max_memory,
+                concurrency,
                 output,
             )
-            .map_err(|err| eco_format!("failed to encode PNG file ({err})"))?;
+            .map_err(|err| eco_format!("failed to encode PNG file ({err})"))
         }
         ImageExportFormat::Svg => {
             let options = svg_options(config);
             let svg = typst_svg::svg(page, &options);
             output
                 .write(svg.as_bytes())
-                .map_err(|err| eco_format!("failed to write SVG file ({err})"))?;
+                .map_err(|err| eco_format!("failed to write SVG file ({err})"))
         }
-    }
-    Ok(())
+    };
+
+    // Give the large transient band/texture buffers this page's export just
+    // freed back to the OS now, rather than leaving them on glibc's
+    // per-thread free list -- see `main::limit_malloc_arenas` for why this
+    // matters most on a warm-reused (e.g. serverless) process. Run
+    // regardless of success or failure, and per-page rather than only once
+    // for the whole document, since `exported_pages.par_iter()` may still
+    // have other pages in flight on other threads.
+    trim_malloc_best_effort();
+
+    result
 }
+
+/// Best-effort hint to glibc to release any memory on its free lists back to
+/// the OS. See `main::limit_malloc_arenas` for the rationale. Linux+glibc
+/// only (`malloc_trim` isn't available on musl or other platforms) and never
+/// required for correctness, so a no-op elsewhere.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_malloc_best_effort() {
+    // SAFETY: `malloc_trim` only returns free heap memory to the OS; it
+    // doesn't affect Rust-level memory safety and is safe to call from any
+    // thread at any time.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_malloc_best_effort() {}
 
 /// The default per-band byte budget and page-cache eviction interval, used
 /// when `--max-memory` isn't given. Tuned for typical documents: e.g. at a
@@ -620,18 +662,28 @@ const BASE_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
 /// hardcoding a band size that happens to work for one particular page size
 /// or asset resolution. Falls back to fixed defaults when no cap is given.
 ///
+/// `concurrency` is the number of pages that may be mid-export at once (see
+/// `export_image`'s `rayon::current_num_threads()`-derived value): the cap
+/// bounds *total* process memory, but `exported_pages.par_iter()` can have
+/// that many pages banding/encoding simultaneously, so each gets only
+/// `1 / concurrency` of the post-overhead budget. Without this, `--max-memory
+/// 512` on a 4-page document exported with `-j 4` would let 4 pages each use
+/// up to ~512 MiB worth of bands at once, breaking the cap by ~4x.
+///
 /// This is a heuristic, not an exact guarantee -- see `BASE_OVERHEAD_BYTES`.
 /// A band's raw canvas, its demultiplied copy, and the source image's
 /// row-range decode buffer (`RasterImage::decode_rgba_row_range`) can all be
-/// alive at once, so the remaining budget is divided across roughly that
-/// many same-order buffers, plus headroom for the eviction interval.
-fn band_budget(max_memory_mib: Option<u64>) -> (usize, u64) {
+/// alive at once, so the remaining per-worker budget is divided across
+/// roughly that many same-order buffers, plus headroom for the eviction
+/// interval.
+fn band_budget(max_memory_mib: Option<u64>, concurrency: usize) -> (usize, u64) {
     let Some(mib) = max_memory_mib else {
         return (DEFAULT_MAX_BAND_BYTES, DEFAULT_EVICT_CHUNK_BYTES);
     };
     let budget = mib.saturating_mul(1024 * 1024).saturating_sub(BASE_OVERHEAD_BYTES);
-    let band_bytes = ((budget / 6) as usize).max(4096);
-    let evict_bytes = (budget / 4).clamp(1024 * 1024, 128 * 1024 * 1024);
+    let per_worker = budget / (concurrency.max(1) as u64);
+    let band_bytes = ((per_worker / 6) as usize).max(4096);
+    let evict_bytes = (per_worker / 4).clamp(1024 * 1024, 128 * 1024 * 1024);
     (band_bytes, evict_bytes)
 }
 
@@ -730,9 +782,10 @@ fn render_and_encode_png_in_bands(
     opts: &RenderOptions,
     compression: PngCompression,
     max_memory_mib: Option<u64>,
+    concurrency: usize,
     output: &Output,
 ) -> Result<(), png::EncodingError> {
-    let (band_bytes, evict_bytes) = band_budget(max_memory_mib);
+    let (band_bytes, evict_bytes) = band_budget(max_memory_mib, concurrency);
 
     // A plain file gets the page-cache-evicting writer (see
     // `EvictingFileWriter`); stdout may be a pipe or terminal rather than a
@@ -966,20 +1019,40 @@ mod tests {
     /// whatever `row_bytes` (i.e. page width) turns out to be.
     #[test]
     fn test_band_budget_scales_with_cap_not_content() {
-        let (default_band, default_evict) = band_budget(None);
+        let (default_band, default_evict) = band_budget(None, 1);
         assert_eq!(default_band, DEFAULT_MAX_BAND_BYTES);
         assert_eq!(default_evict, DEFAULT_EVICT_CHUNK_BYTES);
 
-        let (small_band, small_evict) = band_budget(Some(128));
-        let (large_band, large_evict) = band_budget(Some(2048));
+        let (small_band, small_evict) = band_budget(Some(128), 1);
+        let (large_band, large_evict) = band_budget(Some(2048), 1);
         assert!(small_band < large_band, "{small_band} should be < {large_band}");
         assert!(small_evict < large_evict, "{small_evict} should be < {large_evict}");
 
         // A cap at or below the base overhead allowance still yields a
         // usable (if minimal) band -- at least one row -- rather than
         // zero/underflowing.
-        let (floor_band, floor_evict) = band_budget(Some(1));
+        let (floor_band, floor_evict) = band_budget(Some(1), 1);
         assert!(floor_band > 0);
         assert!(floor_evict > 0);
+    }
+
+    /// A cap unset by `--jobs` still bounds *total* memory when multiple
+    /// pages are exported concurrently: each concurrent worker must get a
+    /// proportionally smaller slice of the same overall cap.
+    #[test]
+    fn test_band_budget_scales_with_concurrency() {
+        let (band_1, evict_1) = band_budget(Some(512), 1);
+        let (band_4, evict_4) = band_budget(Some(512), 4);
+        assert!(band_4 < band_1, "{band_4} should be < {band_1}");
+        assert!(evict_4 < evict_1, "{evict_4} should be < {evict_1}");
+        // Roughly a 4x reduction (integer division, so allow some slack).
+        assert!(band_1 / band_4 >= 3, "expected ~4x smaller, got {band_1}/{band_4}");
+
+        // `concurrency == 0` is treated the same as `1` (never divide by
+        // zero / hand out an unbounded budget).
+        assert_eq!(band_budget(Some(512), 0), band_budget(Some(512), 1));
+
+        // `None` (no cap requested) is unaffected by concurrency.
+        assert_eq!(band_budget(None, 4), band_budget(None, 1));
     }
 }
