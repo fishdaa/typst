@@ -428,7 +428,7 @@ mod tests {
             let mut vec = iter
                 .map(|id| id.get().vpath().get_without_slash())
                 .collect::<Vec<_>>();
-            vec.sort();
+            vec.sort_unstable();
             vec
         };
         store.source(id("a.typ")).must_be(A_TEXT);
@@ -506,7 +506,7 @@ mod tests {
         #[test]
         fn test_fs_root_load_large_file() {
             let dir = tempfile::tempdir().unwrap();
-            let content = vec![0x17u8; 2 * 1024 * 1024];
+            let content = vec![0x17_u8; 2 * 1024 * 1024];
             fs::write(dir.path().join("large.bin"), &content).unwrap();
             let bytes = root(dir.path()).load(&vpath("large.bin")).unwrap();
             assert_eq!(bytes.as_slice(), content.as_slice());

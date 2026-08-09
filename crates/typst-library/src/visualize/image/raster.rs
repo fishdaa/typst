@@ -882,12 +882,10 @@ mod tests {
             _ => unreachable!("test only uses Rgb/Rgba"),
         };
         let mut data = Vec::with_capacity((width * height * channels * 2) as usize);
-        let mut i: u32 = 0;
-        for _ in 0..(width * height * channels) {
+        for i in 0..(width * height * channels) {
             // A varied, deterministic sequence covering low/mid/high values.
-            let v = ((i.wrapping_mul(2654435761)) % 65536) as u16;
+            let v = ((i.wrapping_mul(2654435761)) % 0x0001_0000) as u16;
             data.extend_from_slice(&v.to_be_bytes());
-            i += 1;
         }
 
         let mut out = Vec::new();
@@ -952,7 +950,7 @@ mod tests {
         // truncating `200 >> 8 = 0`. Confirms the formula rounds rather
         // than truncates, matching `image`'s own conversion exactly.
         assert_eq!(sample16_to_8(0x00, 0xC8), 1);
-        assert_ne!(sample16_to_8(0x00, 0xC8), (200u16 >> 8) as u8);
+        assert_ne!(sample16_to_8(0x00, 0xC8), (200_u16 >> 8) as u8);
     }
 
     /// Formats/cases the fast path doesn't support must cleanly fall back
