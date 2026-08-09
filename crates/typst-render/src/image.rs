@@ -30,6 +30,10 @@ pub fn render_image(
         return Some(());
     }
 
+    if try_blit_native_alpha(canvas, &state, image, view_width, view_height).is_some() {
+        return Some(());
+    }
+
     if try_blit_resized_axis_aligned(canvas, &state, image, view_width, view_height)
         .is_some()
     {
@@ -206,6 +210,116 @@ fn try_blit_opaque(
     }
 
     Some(())
+}
+
+/// Fast path for a native-resolution raster image with an alpha channel.
+///
+/// Browser canvas PNGs commonly carry an alpha channel even when every pixel
+/// is opaque. Such images cannot use [`try_blit_opaque`], but they still do
+/// not need a full-size texture: decode the rows visible in this band and
+/// blend them directly into the destination canvas.
+fn try_blit_native_alpha(
+    canvas: &mut sk::Pixmap,
+    state: &State,
+    image: &Image,
+    view_width: f32,
+    view_height: f32,
+) -> Option<()> {
+    if state.mask.is_some() {
+        return None;
+    }
+
+    let ts = state.transform;
+    if ts.kx != 0.0 || ts.ky != 0.0 || ts.sx <= 0.0 || ts.sy <= 0.0 {
+        return None;
+    }
+
+    let ImageKind::Raster(raster) = image.kind() else { return None };
+    if !raster.has_alpha() {
+        return None;
+    }
+
+    let src_w = raster.width();
+    let src_h = raster.height();
+    let x0 = ts.tx;
+    let y0 = ts.ty;
+    let x1 = ts.sx * view_width + ts.tx;
+    let y1 = ts.sy * view_height + ts.ty;
+
+    const EPS: f32 = 0.01;
+    let (rx0, ry0, rx1, ry1) = (x0.round(), y0.round(), x1.round(), y1.round());
+    if (x0 - rx0).abs() > EPS
+        || (y0 - ry0).abs() > EPS
+        || (x1 - rx1).abs() > EPS
+        || (y1 - ry1).abs() > EPS
+    {
+        return None;
+    }
+
+    let dst_w = (rx1 - rx0) as i64;
+    let dst_h = (ry1 - ry0) as i64;
+    if dst_w != src_w as i64 || dst_h != src_h as i64 {
+        return None;
+    }
+
+    let dst_x0 = rx0 as i64;
+    let dst_y0 = ry0 as i64;
+    let clip_x0 = dst_x0.max(0);
+    let clip_y0 = dst_y0.max(0);
+    let clip_x1 = (dst_x0 + dst_w).min(canvas.width() as i64);
+    let clip_y1 = (dst_y0 + dst_h).min(canvas.height() as i64);
+    if clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
+        return Some(());
+    }
+
+    let src_y_range = (clip_y0 - dst_y0) as u32..(clip_y1 - dst_y0) as u32;
+    let src_x_range = (clip_x0 - dst_x0) as u32..(clip_x1 - dst_x0) as u32;
+    let canvas_w = canvas.width() as usize;
+    let pixels = bytemuck::cast_slice_mut::<u8, u32>(canvas.data_mut());
+    let mut blend_row = |sy: u32, row: &[u8]| {
+        let py = (dst_y0 + sy as i64) as usize;
+        for sx in src_x_range.clone() {
+            let idx = sx as usize * 4;
+            let a = row[idx + 3] as u32;
+            let r = ((row[idx] as u32 * a + 127) / 255) as u32;
+            let g = ((row[idx + 1] as u32 * a + 127) / 255) as u32;
+            let b = ((row[idx + 2] as u32 * a + 127) / 255) as u32;
+            let src = r | (g << 8) | (b << 16) | (a << 24);
+            let dst = &mut pixels[py * canvas_w + (dst_x0 + sx as i64) as usize];
+            *dst = src + alpha_mul(*dst, 256 - (src >> 24));
+        }
+    };
+
+    if raster
+        .for_each_rgba_row(src_y_range.start, src_y_range.end, |sy, row| {
+            blend_row(sy, row)
+        })
+        .is_none()
+    {
+        let dynamic = raster.dynamic();
+        for sy in src_y_range.clone() {
+            let py = (dst_y0 + sy as i64) as usize;
+            for sx in src_x_range.clone() {
+                let Rgba([r, g, b, a]) = dynamic.get_pixel(sx, sy);
+                let a = a as u32;
+                let src = ((r as u32 * a + 127) / 255)
+                    | (((g as u32 * a + 127) / 255) << 8)
+                    | (((b as u32 * a + 127) / 255) << 16)
+                    | (a << 24);
+                let dst = &mut pixels[py * canvas_w + (dst_x0 + sx as i64) as usize];
+                *dst = src + alpha_mul(*dst, 256 - (src >> 24));
+            }
+        }
+    }
+
+    Some(())
+}
+
+fn alpha_mul(color: u32, scale: u32) -> u32 {
+    let mask = 0xff00ff;
+    let rb = ((color & mask) * scale) >> 8;
+    let ag = ((color >> 8) & mask) * scale;
+    (rb & mask) | (ag & !mask)
 }
 
 /// Fast path for a raster image that needs resampling (i.e. doesn't qualify

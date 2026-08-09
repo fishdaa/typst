@@ -461,6 +461,23 @@ impl RasterImage {
         *guard = Some(RowCursor { reader, next_row, width, channels, bytes_per_sample });
         Some(out)
     }
+
+    /// Visits source rows `[y0, y1)` one at a time as tightly packed RGBA8.
+    ///
+    /// This is useful when a consumer can process a row immediately instead
+    /// of retaining the complete decoded band. In particular, a native-size
+    /// alpha background can be blended directly into the render canvas with
+    /// only one source row resident.
+    pub fn for_each_rgba_row<F>(&self, y0: u32, y1: u32, mut f: F) -> Option<()>
+    where
+        F: FnMut(u32, &[u8]),
+    {
+        for y in y0..y1 {
+            let row = self.decode_rgba_row_range(y, y + 1)?;
+            f(y, &row);
+        }
+        Some(())
+    }
 }
 
 impl Hash for RasterImageInner {
