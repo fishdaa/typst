@@ -26,6 +26,10 @@ pub fn render_image(
     let view_width = size.x.to_f32();
     let view_height = size.y.to_f32();
 
+    if try_render_svg(canvas, &state, image, view_width, view_height).is_some() {
+        return Some(());
+    }
+
     if try_blit_opaque(canvas, &state, image, view_width, view_height).is_some() {
         return Some(());
     }
@@ -81,6 +85,33 @@ pub fn render_image(
     let rect = sk::Rect::from_xywh(0.0, 0.0, view_width, view_height)?;
     canvas.fill_rect(rect, &paint, ts, state.mask);
 
+    Some(())
+}
+
+/// Render an SVG directly into the destination canvas instead of first
+/// rasterizing the entire placed image into a texture. The canvas may be only
+/// one render band, so resvg clips the result to the visible portion and keeps
+/// memory proportional to the output band rather than the full SVG size.
+fn try_render_svg(
+    canvas: &mut sk::Pixmap,
+    state: &State,
+    image: &Image,
+    view_width: f32,
+    view_height: f32,
+) -> Option<()> {
+    // A mask is applied by tiny-skia while painting the texture in the
+    // fallback path. Rendering directly would bypass that mask.
+    if state.mask.is_some() {
+        return None;
+    }
+
+    let ImageKind::Svg(svg) = image.kind() else { return None };
+    let scale = sk::Transform::from_scale(
+        view_width / svg.width() as f32,
+        view_height / svg.height() as f32,
+    );
+    let transform = state.transform.pre_concat(scale);
+    resvg::render(svg.tree(), transform, &mut canvas.as_mut());
     Some(())
 }
 

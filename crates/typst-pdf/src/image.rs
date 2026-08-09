@@ -293,6 +293,16 @@ fn convert_raster(
             icc_profile.map(|i| i.into()),
             interpolate,
         )
+    } else if matches!(raster.format(), RasterFormat::Exchange(ExchangeFormat::Png))
+        && raster.exif_rotation().is_none()
+        && raster.icc().is_none()
+    {
+        // Keep ordinary PNGs compressed and deferred all the way through PDF
+        // serialization. The custom-image path below decodes the whole image
+        // and retains separate color/alpha buffers, which is unnecessarily
+        // expensive for a PNG that krilla can embed directly.
+        let image_data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(raster.data().clone());
+        krilla::image::Image::from_png(image_data.into(), interpolate)
     } else {
         krilla::image::Image::from_custom(PdfRasterImage::new(raster), interpolate)
     }
