@@ -268,7 +268,7 @@ impl<T: NativeElement + FromValue> FromValue for Packed<T> {
                 Ok(packed) => return Ok(packed),
                 Err(content) => {
                     span = content.span();
-                    value = Value::Content(content)
+                    value = Value::Content(content);
                 }
             }
         }
@@ -382,7 +382,7 @@ impl CastInfo {
             }
         }
 
-        inner(self, &mut f)
+        inner(self, &mut f);
     }
 }
 
@@ -522,6 +522,8 @@ cast! {
     "binary" => MathClass::Binary,
     /// An operator that can be both unary or binary like `+`.
     "vary" => MathClass::Vary,
+    /// An accent character.
+    "diacritic" => MathClass::Diacritic,
 }
 
 /// A type that contains a user-visible source portion and something that is

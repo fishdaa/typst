@@ -22,7 +22,6 @@ use typst_syntax::{
 };
 use utf8_iter::ErrorReportingUtf8Chars;
 
-use crate::engine::Engine;
 use crate::loading::{LoadSource, Loaded};
 use crate::{World, WorldExt};
 
@@ -160,6 +159,8 @@ macro_rules! __error {
 ///     hint[hint_span]: "hints can have custom spans and {}", "formatting";
 /// );
 /// ```
+///
+/// [`Engine`]: crate::engine::Engine
 #[macro_export]
 #[doc(hidden)]
 #[clippy::format_args]
@@ -414,17 +415,14 @@ pub trait WarningSink {
     fn emit(&mut self, message: HintedString);
 }
 
-impl WarningSink for () {
-    fn emit(&mut self, _: HintedString) {}
+impl<T: WarningSink> WarningSink for &mut T {
+    fn emit(&mut self, message: HintedString) {
+        T::emit(self, message);
+    }
 }
 
-impl WarningSink for (&mut Engine<'_>, Span) {
-    fn emit(&mut self, hinted: HintedString) {
-        self.0.sink.warn(
-            SourceDiagnostic::warning(self.1, hinted.message())
-                .with_hints(hinted.hints().iter().cloned()),
-        );
-    }
+impl WarningSink for () {
+    fn emit(&mut self, _: HintedString) {}
 }
 
 /// A part of a diagnostic's [trace](SourceDiagnostic::trace).
@@ -514,7 +512,7 @@ pub type HintedStrResult<T> = Result<T, HintedString>;
 /// This is internally represented by a vector of strings.
 /// - The first element of the vector contains the message.
 /// - The remaining elements are the hints.
-/// - This is done to reduce the size of a HintedString.
+/// - This is done to reduce the size of a [`HintedString`].
 /// - The vector is guaranteed to not be empty.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct HintedString(EcoVec<EcoString>);
@@ -1027,7 +1025,6 @@ impl LineCol {
     pub fn try_from_byte_pos(pos: usize, bytes: &[u8]) -> Option<Self> {
         let bytes = &bytes[..pos];
         let mut line = 0;
-        #[allow(clippy::double_ended_iterator_last)]
         let line_start = memchr::memchr_iter(b'\n', bytes)
             .inspect(|_| line += 1)
             .last()

@@ -8,7 +8,6 @@ use crate::diag::SourceResult;
 use crate::diag::bail;
 use crate::engine::Engine;
 use crate::foundations::{Args, Construct, Content, NativeElement, Smart};
-use crate::introspection::Tagged;
 use crate::model::{TableCell, TableElem};
 
 /// Marks content as a PDF artifact.
@@ -34,7 +33,7 @@ use crate::model::{TableCell, TableElem};
 /// In the future, this function may be moved out of the `pdf` module, making it
 /// possible to hide content in HTML export from AT.
 // TODO: maybe generalize this and use it to mark html elements with `aria-hidden="true"`?
-#[elem(Tagged)]
+#[elem(since = "0.14.0", Tagged)]
 pub struct ArtifactElem {
     /// The artifact kind.
     ///
@@ -135,7 +134,7 @@ pub enum ArtifactKind {
 ///   caption: [The Sales org now has a new member],
 /// )
 /// ```
-#[func]
+#[func(since = "0.14.0")]
 pub fn table_summary(
     #[named] summary: Option<EcoString>,
     /// The table.
@@ -201,7 +200,7 @@ pub fn table_summary(
 ///   [30g], [45g],
 /// )
 /// ```
-#[func]
+#[func(since = "0.14.0")]
 pub fn header_cell(
     /// The nesting level of this header cell.
     #[named]
@@ -262,7 +261,7 @@ pub fn header_cell(
 ///   [], [Close 50 enterprise deals], [38],
 /// )
 /// ```
-#[func]
+#[func(since = "0.14.0")]
 pub fn data_cell(
     /// The table cell.
     ///
@@ -339,7 +338,7 @@ macro_rules! pdf_marker_tag {
         impl PdfMarkerTag {
             $(
                 #[doc = $doc]
-                #[allow(non_snake_case)]
+                #[expect(non_snake_case)]
                 pub fn $variant($($($name: $ty,)+)? body: Content) -> Content {
                     let span = body.span();
                     Self {

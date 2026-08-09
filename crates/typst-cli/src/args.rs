@@ -209,7 +209,7 @@ pub struct EvalCommand {
 
     /// The format to serialize in.
     #[clap(long = "format", default_value_t)]
-    pub format: SerializationFormat,
+    pub format: EvalSerializationFormat,
 
     /// Whether to pretty-print the serialized output.
     ///
@@ -411,7 +411,7 @@ pub struct CompileArgs {
     /// Produces performance timings of the compilation process. (experimental)
     ///
     /// The resulting JSON file can be loaded into a tracing tool such as
-    /// https://ui.perfetto.dev. It does not contain any sensitive information
+    /// <https://ui.perfetto.dev>. It does not contain any sensitive information
     /// apart from file names and line numbers.
     #[arg(long = "timings", value_name = "OUTPUT_JSON")]
     pub timings: Option<PathBuf>,
@@ -467,7 +467,7 @@ pub struct ProcessArgs {
     pub features: Vec<Feature>,
 
     /// The format to emit diagnostics in.
-    #[clap(long, default_value_t)]
+    #[clap(long, default_value_t, env = "TYPST_DIAGNOSTIC_FORMAT")]
     pub diagnostic_format: DiagnosticFormat,
 }
 
@@ -622,7 +622,7 @@ pub enum OutputFormat {
 
 impl OutputFormat {
     /// Whether this format results in a `PagedDocument`.
-    pub fn is_paged(&self) -> bool {
+    pub fn is_paged(self) -> bool {
         matches!(self, Self::Pdf | Self::Png | Self::Svg)
     }
 }
@@ -710,7 +710,7 @@ display_possible_values!(Feature);
 
 /// A PDF standard that Typst can enforce conformance with.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 pub enum PdfStandard {
     /// PDF 1.4.
     #[value(name = "1.4")]
@@ -777,11 +777,24 @@ pub enum SerializationFormat {
 
 display_possible_values!(SerializationFormat);
 
+/// Output file format for eval command
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, ValueEnum)]
+pub enum EvalSerializationFormat {
+    #[default]
+    Json,
+    Yaml,
+    /// Prints the output without any additional formatting or escaping
+    /// (only supports strings and bytes).
+    Raw,
+}
+
+display_possible_values!(EvalSerializationFormat);
+
 /// Implements parsing of page ranges (`1-3`, `4`, `5-`, `-2`), used by the
 /// `CompileCommand.pages` argument, through the `FromStr` trait instead of a
 /// value parser, in order to generate better errors.
 ///
-/// See also: https://github.com/clap-rs/clap/issues/5065
+/// See also: <https://github.com/clap-rs/clap/issues/5065>
 #[derive(Debug, Clone)]
 pub struct Pages(pub RangeInclusive<Option<NonZeroUsize>>);
 

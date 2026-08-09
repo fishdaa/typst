@@ -537,7 +537,8 @@ pub enum ExchangeFormat {
 impl ExchangeFormat {
     /// Try to detect the format of data in a buffer.
     pub fn detect(data: &[u8]) -> Option<Self> {
-        guess_format(data).ok().and_then(|format| format.try_into().ok())
+        let format = guess_format(data).ok()?;
+        format.try_into().ok()
     }
 }
 
