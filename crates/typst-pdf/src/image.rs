@@ -139,14 +139,11 @@ struct Channels {
 /// `CustomImage::color_channel`) and an optional alpha channel, in a single
 /// pass over the source pixels where possible.
 ///
-/// For a qualifying PNG (see [`RasterImage::decode_rgba_row_range`]), this
+/// For a qualifying PNG (see [`RasterImage::for_each_rgba_row`]), this
 /// decodes directly via the row-streaming path instead of
-/// [`RasterImage::dynamic`], so the whole-image RGBA buffer is a local
-/// temporary dropped once `color`/`alpha` are split out of it, rather than
-/// being permanently cached inside `raster` -- a PDF-only consumer has no
-/// other use for that interleaved form once the split is done. Otherwise
-/// (non-PNG, interlaced, or EXIF-rotated images), this falls back to
-/// `raster.dynamic()`, matching the previous behavior.
+/// [`RasterImage::dynamic`], so no whole-image interleaved RGBA buffer is
+/// created while `color`/`alpha` are built. Otherwise (non-PNG, interlaced,
+/// or EXIF-rotated images), this falls back to `raster.dynamic()`.
 ///
 /// Splitting used to happen as two independent passes -- `color_channel`
 /// building its converted buffer via `to_rgb8()`/`to_luma8()`, and
@@ -155,22 +152,30 @@ struct Channels {
 /// `pixels()`'s per-pixel bounds-checked indexing. Both are now produced in
 /// one direct pass over the raw byte slice instead, for the same result.
 fn derive_channels(raster: &RasterImage) -> Channels {
-    if let Some(rgba) = raster.decode_rgba_row_range(0, raster.height()) {
+    if raster.exif_rotation().is_none()
+        && matches!(raster.format(), RasterFormat::Exchange(ExchangeFormat::Png))
+    {
         let pixels = raster.width() as usize * raster.height() as usize;
         let mut color = Vec::with_capacity(pixels * 3);
         let mut alpha = raster.has_alpha().then(|| Vec::with_capacity(pixels));
-        for px in rgba.chunks_exact(4) {
-            color.extend_from_slice(&px[..3]);
-            if let Some(alpha) = &mut alpha {
-                alpha.push(px[3]);
-            }
+        if raster
+            .for_each_rgba_row(0, raster.height(), |_, row| {
+                for px in row.chunks_exact(4) {
+                    color.extend_from_slice(&px[..3]);
+                    if let Some(alpha) = &mut alpha {
+                        alpha.push(px[3]);
+                    }
+                }
+            })
+            .is_some()
+        {
+            return Channels {
+                color: ColorBuf::Owned(color),
+                is_rgb: true,
+                alpha,
+                icc_valid: raster.is_native_8bit(),
+            };
         }
-        return Channels {
-            color: ColorBuf::Owned(color),
-            is_rgb: true,
-            alpha,
-            icc_valid: raster.is_native_8bit(),
-        };
     }
 
     let dynamic = raster.dynamic();

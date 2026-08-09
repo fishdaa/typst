@@ -99,19 +99,43 @@ fn try_render_svg(
     view_width: f32,
     view_height: f32,
 ) -> Option<()> {
-    // A mask is applied by tiny-skia while painting the texture in the
-    // fallback path. Rendering directly would bypass that mask.
-    if state.mask.is_some() {
+    let ImageKind::Svg(svg) = image.kind() else { return None };
+
+    // Keep the established texture path for ordinary SVGs. Direct resvg
+    // rendering is intentionally reserved for placements large enough that
+    // the old full-image texture becomes a material memory problem: the two
+    // paths have small rasterization differences, and preserving the old path
+    // for normal-sized assets keeps existing render output stable.
+    const DIRECT_RENDER_THRESHOLD: u64 = 16 * 1024 * 1024;
+    let pixels = (view_width.max(0.0) as u64).saturating_mul(view_height.max(0.0) as u64);
+    if pixels < DIRECT_RENDER_THRESHOLD {
         return None;
     }
 
-    let ImageKind::Svg(svg) = image.kind() else { return None };
     let scale = sk::Transform::from_scale(
         view_width / svg.width() as f32,
         view_height / svg.height() as f32,
     );
     let transform = state.transform.pre_concat(scale);
-    resvg::render(svg.tree(), transform, &mut canvas.as_mut());
+
+    if let Some(mask) = state.mask {
+        // Render into a canvas-sized temporary so the mask can be applied by
+        // tiny-skia during compositing. This remains bounded by the current
+        // render band instead of the full placed SVG dimensions.
+        let mut rendered = sk::Pixmap::new(canvas.width(), canvas.height())?;
+        resvg::render(svg.tree(), transform, &mut rendered.as_mut());
+        canvas.draw_pixmap(
+            0,
+            0,
+            rendered.as_ref(),
+            &sk::PixmapPaint::default(),
+            sk::Transform::identity(),
+            Some(mask),
+        );
+    } else {
+        resvg::render(svg.tree(), transform, &mut canvas.as_mut());
+    }
+
     Some(())
 }
 
