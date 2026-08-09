@@ -318,9 +318,15 @@ pub fn compile_once(
             .map_err(|err| eco_format!("failed to create dependency file ({err})"))?;
     }
 
-    // Final sweep: PDF/HTML/bundle exports (unlike PNG, see
-    // `export_image_page`) don't trim per-output, so do it once here for the
-    // whole compile.
+    // Final sweep: unlike `watch`, a one-shot compile never revisits this
+    // `World`, so there's no incremental-reuse value in keeping comemo's
+    // memoized results (decoded images, rendered textures, etc.) around --
+    // clear them so a warm-reused process (e.g. a serverless runtime handling
+    // another invocation next) doesn't carry this compile's image cache
+    // forward as baseline RSS. PDF/HTML/bundle exports (unlike PNG, see
+    // `export_image_page`) don't evict/trim per-output, so do it once here
+    // for the whole compile.
+    comemo::evict(0);
     trim_malloc_best_effort();
 
     Ok(())

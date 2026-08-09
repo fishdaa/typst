@@ -30,6 +30,11 @@ struct RasterImageInner {
     /// alone (color type plus presence of a `tRNS` chunk), without decoding
     /// pixels.
     has_alpha: bool,
+    /// For a PNG, whether its channels are natively 8 bits per sample
+    /// (`None` for other formats, where [`RasterImage::is_native_8bit`]
+    /// checks the eagerly-decoded `dynamic` instead, which costs nothing
+    /// extra since it's already resident). Also known from the header alone.
+    png_is_8bit: Option<bool>,
     /// The fully decoded image, decoded lazily on first access via
     /// [`RasterImage::dynamic`] -- so a caller that only ever needs a region
     /// of the image (see [`RasterImage::decode_rgba_row_range`]) never pays
@@ -117,9 +122,10 @@ impl RasterImage {
         // discarding each row, which bounds memory to a single row rather
         // than the whole image while still failing fast on a malformed
         // file, exactly like the eager formats below.
-        let (width, height, has_alpha, icc, dpi, eager_dynamic) = match format {
+        let (width, height, has_alpha, icc, dpi, eager_dynamic, png_is_8bit) = match format
+        {
             RasterFormat::Exchange(ExchangeFormat::Png) => {
-                let (raw_w, raw_h, has_alpha, icc) = validate_png(&data, icc)?;
+                let (raw_w, raw_h, has_alpha, icc, is_8bit) = validate_png(&data, icc)?;
 
                 let exif = exif::Reader::new()
                     .read_from_container(&mut io::Cursor::new(&data))
@@ -134,7 +140,7 @@ impl RasterImage {
                 }
 
                 let dpi = determine_dpi(&data, exif.as_ref());
-                (width, height, has_alpha, icc, dpi, None)
+                (width, height, has_alpha, icc, dpi, None, Some(is_8bit))
             }
 
             RasterFormat::Exchange(format) => {
@@ -182,7 +188,7 @@ impl RasterImage {
                 let has_alpha = dynamic.color().has_alpha();
                 let (width, height) = (dynamic.width(), dynamic.height());
 
-                (width, height, has_alpha, icc, dpi, Some(dynamic))
+                (width, height, has_alpha, icc, dpi, Some(dynamic), None)
             }
 
             RasterFormat::Pixel(format) => {
@@ -236,6 +242,7 @@ impl RasterImage {
                     icc.custom(),
                     None,
                     Some(dynamic),
+                    None,
                 )
             }
         };
@@ -251,6 +258,7 @@ impl RasterImage {
             width,
             height,
             has_alpha,
+            png_is_8bit,
             dynamic: dynamic_cell,
             exif_rotation: exif_rot,
             icc,
@@ -310,6 +318,28 @@ impl RasterImage {
     /// Whether the image has an alpha channel.
     pub fn has_alpha(&self) -> bool {
         self.0.has_alpha
+    }
+
+    /// Whether the image's channels are natively 8 bits per sample, i.e.
+    /// deriving an 8-bit-per-channel buffer from it involves no lossy
+    /// bit-depth reduction.
+    ///
+    /// Consumers that split the image into separate color/alpha buffers for
+    /// re-embedding (e.g. PDF export) use this to decide whether an embedded
+    /// ICC profile is still valid for the re-derived buffer, without forcing
+    /// a full decode via [`Self::dynamic`] just to check: for PNG this is
+    /// already known from the header alone (see [`Self::decode_rgba_row_range`],
+    /// which similarly avoids a full decode).
+    pub fn is_native_8bit(&self) -> bool {
+        self.0.png_is_8bit.unwrap_or_else(|| {
+            matches!(
+                self.dynamic().as_ref(),
+                DynamicImage::ImageLuma8(_)
+                    | DynamicImage::ImageLumaA8(_)
+                    | DynamicImage::ImageRgb8(_)
+                    | DynamicImage::ImageRgba8(_)
+            )
+        })
     }
 
     /// The EXIF orientation value of the original image.
@@ -596,11 +626,11 @@ fn sample16_to_8(hi: u8, lo: u8) -> u8 {
 /// each row is decoded and discarded, so peak memory here is bounded by a
 /// single row rather than the whole image, while still failing fast (like
 /// the eager formats in `new_impl`) on a malformed file. Returns
-/// `(width, height, has_alpha, icc)`.
+/// `(width, height, has_alpha, icc, is_8bit)`.
 fn validate_png(
     data: &Bytes,
     icc: Smart<Bytes>,
-) -> StrResult<(u32, u32, bool, Option<Bytes>)> {
+) -> StrResult<(u32, u32, bool, Option<Bytes>, bool)> {
     let mut reader = png_reader(data.clone()).map_err(png_error_message)?;
 
     let (width, height) = {
@@ -621,15 +651,16 @@ fn validate_png(
             .map(Bytes::new)
     });
 
-    let (color_type, _) = reader.output_color_type();
+    let (color_type, bit_depth) = reader.output_color_type();
     let has_alpha =
         matches!(color_type, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
+    let is_8bit = bit_depth == png::BitDepth::Eight;
 
     // Stream through (and discard) the rest of the rows to confirm the
     // whole image decodes without error.
     while reader.next_row().map_err(png_error_message)?.is_some() {}
 
-    Ok((width, height, has_alpha, icc))
+    Ok((width, height, has_alpha, icc, is_8bit))
 }
 
 /// Try to get the rotation from the EXIF metadata.
