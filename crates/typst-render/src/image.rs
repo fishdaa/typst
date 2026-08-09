@@ -36,6 +36,11 @@ pub fn render_image(
         return Some(());
     }
 
+    if try_blit_resized_general(canvas, &state, image, view_width, view_height).is_some()
+    {
+        return Some(());
+    }
+
     // For better-looking output, resize `image` to its final size before
     // painting it to `canvas`. For the math, see:
     // https://github.com/typst/typst/issues/1404#issuecomment-1598374652
@@ -377,6 +382,202 @@ fn try_blit_resized_axis_aligned(
         sk::Transform::identity(),
         state.mask,
     );
+
+    Some(())
+}
+
+/// Rotation/skew counterpart to [`try_blit_resized_axis_aligned`]: bounds
+/// memory the same way (a small cropped tile instead of a whole-image
+/// texture) for a row-range-decodable raster image, even when the
+/// placement's transform isn't axis-aligned.
+///
+/// Without this, any rotated or skewed raster image (however slightly --
+/// even a fraction of a degree) fell through to the general path below,
+/// which always builds a texture sized to the *whole placed image* via
+/// `build_texture`/`to_rgba8`, regardless of how much of it actually
+/// overlaps the current canvas. For a page rendered in bands (see
+/// `render_band`), that's a whole-page-sized allocation on the very first
+/// band -- comemo then reuses it for subsequent bands (so it only happens
+/// once), but that one allocation alone can already exceed a tight
+/// `--max-memory` budget for a large full-bleed background, defeating
+/// banding entirely for exactly the scenario it's meant to help.
+///
+/// Returns `None` (with no side effects) whenever a precondition doesn't
+/// hold (not a raster image, or the source doesn't qualify for
+/// [`RasterImage::decode_rgba_row_range`] -- interlaced, EXIF-rotated, or
+/// non-PNG), so callers fall back to the general path unchanged.
+fn try_blit_resized_general(
+    canvas: &mut sk::Pixmap,
+    state: &State,
+    image: &Image,
+    view_width: f32,
+    view_height: f32,
+) -> Option<()> {
+    let ts = state.transform;
+    let ImageKind::Raster(raster) = image.kind() else { return None };
+    let (src_w, src_h) = (raster.width(), raster.height());
+
+    fn minmax(points: &[sk::Point]) -> (f32, f32, f32, f32) {
+        let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in points {
+            min_x = min_x.min(p.x);
+            max_x = max_x.max(p.x);
+            min_y = min_y.min(p.y);
+            max_y = max_y.max(p.y);
+        }
+        (min_x, max_x, min_y, max_y)
+    }
+
+    // Canvas-space bounding box of the transformed placement rect, clipped
+    // to the canvas -- for a page rendered in bands, the canvas only covers
+    // one band, so a full-page image only partially (or not at all)
+    // overlaps it.
+    let mut corners = [
+        sk::Point { x: 0.0, y: 0.0 },
+        sk::Point { x: view_width, y: 0.0 },
+        sk::Point { x: 0.0, y: view_height },
+        sk::Point { x: view_width, y: view_height },
+    ];
+    ts.map_points(&mut corners);
+    let (min_x, max_x, min_y, max_y) = minmax(&corners);
+
+    let clip_x0 = (min_x.floor() as i64).max(0);
+    let clip_y0 = (min_y.floor() as i64).max(0);
+    let clip_x1 = (max_x.ceil() as i64).min(canvas.width() as i64);
+    let clip_y1 = (max_y.ceil() as i64).min(canvas.height() as i64);
+    if clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
+        // No overlap with this band/canvas at all.
+        return Some(());
+    }
+
+    // Map the clipped canvas rect back into local placement space (via the
+    // inverse transform) to find which part of the image this band
+    // actually needs.
+    let inv = ts.invert()?;
+    let mut canvas_corners = [
+        sk::Point { x: clip_x0 as f32, y: clip_y0 as f32 },
+        sk::Point { x: clip_x1 as f32, y: clip_y0 as f32 },
+        sk::Point { x: clip_x0 as f32, y: clip_y1 as f32 },
+        sk::Point { x: clip_x1 as f32, y: clip_y1 as f32 },
+    ];
+    inv.map_points(&mut canvas_corners);
+    let (local_min_x, local_max_x, local_min_y, local_max_y) = minmax(&canvas_corners);
+
+    let local_x0 = local_min_x.clamp(0.0, view_width);
+    let local_x1 = local_max_x.clamp(0.0, view_width);
+    let local_y0 = local_min_y.clamp(0.0, view_height);
+    let local_y1 = local_max_y.clamp(0.0, view_height);
+    if local_x1 <= local_x0 || local_y1 <= local_y0 {
+        return Some(());
+    }
+
+    // The same target-resolution computation the general (unbounded) path
+    // uses below, needed here to know the local-space-to-source-pixel
+    // ratio. See the comment there for the math's origin.
+    let theta = libm::atan2f(-ts.kx, ts.sx);
+    let prefer_sin = libm::sinf(theta).abs() > std::f32::consts::FRAC_1_SQRT_2;
+    let scale = f32::abs(if prefer_sin {
+        ts.kx / libm::sinf(theta)
+    } else {
+        ts.sx / libm::cosf(theta)
+    });
+    let aspect = src_w as f32 / src_h as f32;
+    let full_w = (scale * view_width.max(aspect * view_height)).ceil().max(1.0) as u32;
+    let full_h = ((full_w as f32) / aspect).ceil().max(1.0) as u32;
+
+    let upscale = full_w > src_w || full_h > src_h;
+    let (alg, support) = match image.scaling() {
+        Smart::Custom(ImageScaling::Pixelated) => (ResizeAlg::Nearest, 0.0),
+        _ if upscale => (ResizeAlg::Convolution(FilterType::CatmullRom), 2.0),
+        _ => (ResizeAlg::Convolution(FilterType::Lanczos3), 3.0),
+    };
+
+    // Map the needed local rect into texture-pixel space (the space
+    // `build_texture(image, full_w, full_h)` would produce), expanded by
+    // the resample filter's kernel support on each side, same idea as
+    // `try_blit_resized_axis_aligned`.
+    let scale_x = src_w as f64 / full_w as f64;
+    let scale_y = src_h as f64 / full_h as f64;
+    // A larger constant than `try_blit_resized_axis_aligned` uses: unlike
+    // that function's pixel-grid-aligned tiles, a rotated/skewed tile's
+    // needed region comes from inverse-transforming the canvas clip rect,
+    // which can be off by a subpixel amount at the tile's edge -- extra
+    // slack here avoids a visible seam where the image's own (possibly
+    // rotated) edge crosses a band boundary.
+    let margin_x = (support * scale_x.max(1.0)).ceil() as i64 + 6;
+    let margin_y = (support * scale_y.max(1.0)).ceil() as i64 + 6;
+
+    let tex_x0 = local_x0 as f64 * full_w as f64 / view_width as f64;
+    let tex_x1 = local_x1 as f64 * full_w as f64 / view_width as f64;
+    let tex_y0 = local_y0 as f64 * full_h as f64 / view_height as f64;
+    let tex_y1 = local_y1 as f64 * full_h as f64 / view_height as f64;
+
+    let start_x = ((tex_x0.floor() as i64) - margin_x).clamp(0, full_w as i64) as u32;
+    let start_y = ((tex_y0.floor() as i64) - margin_y).clamp(0, full_h as i64) as u32;
+    let end_x = ((tex_x1.ceil() as i64) + margin_x).clamp(0, full_w as i64) as u32;
+    let end_y = ((tex_y1.ceil() as i64) + margin_y).clamp(0, full_h as i64) as u32;
+    let (crop_w, crop_h) = (end_x - start_x, end_y - start_y);
+    if crop_w == 0 || crop_h == 0 {
+        return Some(());
+    }
+
+    let crop_left = start_x as f64 * scale_x;
+    let crop_top = start_y as f64 * scale_y;
+    let crop_width = crop_w as f64 * scale_x;
+    let crop_height = crop_h as f64 * scale_y;
+
+    let row_lo = crop_top.floor().max(0.0) as u32;
+    let row_hi = (crop_top + crop_height).ceil().min(src_h as f64) as u32;
+
+    let region = raster.decode_rgba_row_range(row_lo, row_hi)?;
+    let region_h = row_hi - row_lo;
+    let region_img = FirImage::from_vec_u8(src_w, region_h, region, PixelType::U8x4).ok()?;
+
+    // See the matching comment in `try_blit_resized_axis_aligned`: the
+    // nominal crop rect can extend past what was actually decoded at the
+    // image's bottom/right edge, so clamp it back.
+    let local_crop_top = crop_top - row_lo as f64;
+    let crop_height = crop_height.min(region_h as f64 - local_crop_top);
+    let crop_width = crop_width.min(src_w as f64 - crop_left);
+
+    let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
+    let opts = ResizeOptions::new()
+        .resize_alg(alg)
+        .crop(crop_left, local_crop_top, crop_width, crop_height);
+    Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
+
+    let mut tile = sk::Pixmap::new(crop_w, crop_h)?;
+    for (src, dest) in resized.buffer().chunks_exact(4).zip(tile.pixels_mut()) {
+        *dest = sk::ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+    }
+
+    // Paint the small tile with the *same* affine transform the unbounded
+    // path uses, just restricted to the local-space sub-rect this tile
+    // actually covers -- `fill_rect` takes care of applying `ts` (rotation
+    // included) to both `rect` and the pattern's sample space, and of
+    // clipping to the canvas, exactly as it already did for the full-image
+    // case.
+    let sub_x0 = start_x as f32 * view_width / full_w as f32;
+    let sub_y0 = start_y as f32 * view_height / full_h as f32;
+    let sub_w = crop_w as f32 * view_width / full_w as f32;
+    let sub_h = crop_h as f32 * view_height / full_h as f32;
+    let paint_scale_x = view_width / full_w as f32;
+    let paint_scale_y = view_height / full_h as f32;
+
+    let paint = sk::Paint {
+        shader: sk::Pattern::new(
+            tile.as_ref(),
+            sk::SpreadMode::Pad,
+            sk::FilterQuality::Nearest,
+            1.0,
+            sk::Transform::from_scale(paint_scale_x, paint_scale_y)
+                .post_concat(sk::Transform::from_translate(sub_x0, sub_y0)),
+        ),
+        ..Default::default()
+    };
+    let rect = sk::Rect::from_xywh(sub_x0, sub_y0, sub_w, sub_h)?;
+    canvas.fill_rect(rect, &paint, ts, state.mask);
 
     Some(())
 }
