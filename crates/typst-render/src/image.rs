@@ -336,9 +336,9 @@ fn try_blit_native_alpha(
         for sx in src_x_range.clone() {
             let idx = sx as usize * 4;
             let a = row[idx + 3] as u32;
-            let r = ((row[idx] as u32 * a + 127) / 255) as u32;
-            let g = ((row[idx + 1] as u32 * a + 127) / 255) as u32;
-            let b = ((row[idx + 2] as u32 * a + 127) / 255) as u32;
+            let r = (row[idx] as u32 * a + 127) / 255;
+            let g = (row[idx + 1] as u32 * a + 127) / 255;
+            let b = (row[idx + 2] as u32 * a + 127) / 255;
             let src = r | (g << 8) | (b << 16) | (a << 24);
             let dst = &mut pixels[py * canvas_w + (dst_x0 + sx as i64) as usize];
             *dst = src + alpha_mul(*dst, 256 - (src >> 24));
@@ -347,7 +347,7 @@ fn try_blit_native_alpha(
 
     if raster
         .for_each_rgba_row(src_y_range.start, src_y_range.end, |sy, row| {
-            blend_row(sy, row)
+            blend_row(sy, row);
         })
         .is_none()
     {
