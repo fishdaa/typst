@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::io::{self, Write};
 use std::path::Path;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
@@ -24,7 +25,7 @@ use typst_utils::Scalar;
 
 use crate::args::{
     CompileArgs, CompileCommand, DepsFormat, DiagnosticFormat, Input, Output,
-    OutputFormat, PdfStandard, WatchCommand,
+    OutputFormat, PdfStandard, PngCompression, WatchCommand,
 };
 use crate::deps::write_deps;
 use crate::watch::Status;
@@ -80,6 +81,11 @@ pub struct CompileConfig {
     pub deps_format: DepsFormat,
     /// The PPI (pixels per inch) to use for PNG export.
     pub ppi: f64,
+    /// The compression effort to use for PNG export.
+    pub png_compression: PngCompression,
+    /// Caps peak memory used while rendering a page to PNG, in mebibytes.
+    /// `None` uses a fixed built-in budget. See `CompileArgs::max_memory`.
+    pub max_memory: Option<u64>,
     /// The export cache for images, used for caching output files in `typst
     /// watch` sessions with images.
     pub export_cache: ExportCache,
@@ -240,6 +246,8 @@ impl CompileConfig {
                 })
                 .transpose()?,
             ppi: args.ppi,
+            png_compression: args.png_compression,
+            max_memory: args.max_memory,
             diagnostic_format: args.process.diagnostic_format,
             open: args.open.clone(),
             export_cache: ExportCache::new(),
@@ -309,6 +317,17 @@ pub fn compile_once(
         write_deps(world, dest, config.deps_format, output.as_deref().ok())
             .map_err(|err| eco_format!("failed to create dependency file ({err})"))?;
     }
+
+    // Final sweep: unlike `watch`, a one-shot compile never revisits this
+    // `World`, so there's no incremental-reuse value in keeping comemo's
+    // memoized results (decoded images, rendered textures, etc.) around --
+    // clear them so a warm-reused process (e.g. a serverless runtime handling
+    // another invocation next) doesn't carry this compile's image cache
+    // forward as baseline RSS. PDF/HTML/bundle exports (unlike PNG, see
+    // `export_image_page`) don't evict/trim per-output, so do it once here
+    // for the whole compile.
+    comemo::evict(0);
+    trim_malloc_best_effort();
 
     Ok(())
 }
@@ -493,6 +512,14 @@ fn export_image(
         bail!("cannot export multiple images {err}");
     }
 
+    // `exported_pages.par_iter()` below can have this many pages mid-band
+    // simultaneously, so `--max-memory`'s per-page budget (`band_budget`)
+    // must be divided across it to keep the flag's cap meaningful for
+    // multi-page documents. `current_num_threads()` reflects `-j`/`--jobs`
+    // (set via `rayon::ThreadPoolBuilder::build_global` in
+    // `SystemWorld::new`) or the CPU count if unset.
+    let concurrency = rayon::current_num_threads().min(exported_pages.len().max(1));
+
     // The results are collected in a `Vec<()>` which does not allocate.
     exported_pages
         .par_iter()
@@ -527,7 +554,7 @@ fn export_image(
                 Output::Stdout => Output::Stdout,
             };
 
-            export_image_page(config, page, &output, fmt)?;
+            export_image_page(config, page, concurrency, &output, fmt)?;
             Ok(output)
         })
         .collect::<StrResult<Vec<Output>>>()
@@ -566,28 +593,259 @@ mod output_template {
 fn export_image_page(
     config: &CompileConfig,
     page: &Page,
+    concurrency: usize,
     output: &Output,
     fmt: ImageExportFormat,
 ) -> StrResult<()> {
-    match fmt {
+    let result = match fmt {
         ImageExportFormat::Png => {
             let options = png_options(config);
-            let pixmap = typst_render::render(page, &options);
-            let buf = pixmap
-                .encode_png()
-                .map_err(|err| eco_format!("failed to encode PNG file ({err})"))?;
-            output
-                .write(&buf)
-                .map_err(|err| eco_format!("failed to write PNG file ({err})"))?;
+            render_and_encode_png_in_bands(
+                page,
+                &options,
+                config.png_compression,
+                config.max_memory,
+                concurrency,
+                output,
+            )
+            .map_err(|err| eco_format!("failed to encode PNG file ({err})"))
         }
         ImageExportFormat::Svg => {
             let options = svg_options(config);
             let svg = typst_svg::svg(page, &options);
             output
                 .write(svg.as_bytes())
-                .map_err(|err| eco_format!("failed to write SVG file ({err})"))?;
+                .map_err(|err| eco_format!("failed to write SVG file ({err})"))
         }
+    };
+
+    // Give the large transient band/texture buffers this page's export just
+    // freed back to the OS now, rather than leaving them on glibc's
+    // per-thread free list -- see `main::limit_malloc_arenas` for why this
+    // matters most on a warm-reused (e.g. serverless) process. Run
+    // regardless of success or failure, and per-page rather than only once
+    // for the whole document, since `exported_pages.par_iter()` may still
+    // have other pages in flight on other threads.
+    trim_malloc_best_effort();
+
+    result
+}
+
+/// Best-effort hint to glibc to release any memory on its free lists back to
+/// the OS. See `main::limit_malloc_arenas` for the rationale. Linux+glibc
+/// only (`malloc_trim` isn't available on musl or other platforms) and never
+/// required for correctness, so a no-op elsewhere.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_malloc_best_effort() {
+    // SAFETY: `malloc_trim` only returns free heap memory to the OS; it
+    // doesn't affect Rust-level memory safety and is safe to call from any
+    // thread at any time.
+    unsafe {
+        libc::malloc_trim(0);
     }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_malloc_best_effort() {}
+
+/// The default per-band byte budget and page-cache eviction interval, used
+/// when `--max-memory` isn't given. Tuned for typical documents: e.g. at a
+/// poster's width (~7200px) `DEFAULT_MAX_BAND_BYTES` yields bands of roughly
+/// 500 rows.
+const DEFAULT_MAX_BAND_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_EVICT_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+
+/// A rough allowance for peak memory `--max-memory` doesn't control: the
+/// in-memory document model, font/glyph caches, and other per-process
+/// overhead that exists regardless of how small banding is made. Without
+/// this, a tight `--max-memory` value would ask for band/eviction sizes far
+/// below what's actually achievable, without making the result any smaller.
+const BASE_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Derives the per-band byte budget and page-cache eviction interval (see
+/// `EvictingFileWriter`) from a user-specified memory cap in mebibytes, so
+/// the same flag value scales both to fit *any* document -- rather than
+/// hardcoding a band size that happens to work for one particular page size
+/// or asset resolution. Falls back to fixed defaults when no cap is given.
+///
+/// `concurrency` is the number of pages that may be mid-export at once (see
+/// `export_image`'s `rayon::current_num_threads()`-derived value): the cap
+/// bounds *total* process memory, but `exported_pages.par_iter()` can have
+/// that many pages banding/encoding simultaneously, so each gets only
+/// `1 / concurrency` of the post-overhead budget. Without this, `--max-memory
+/// 512` on a 4-page document exported with `-j 4` would let 4 pages each use
+/// up to ~512 MiB worth of bands at once, breaking the cap by ~4x.
+///
+/// This is a heuristic, not an exact guarantee -- see `BASE_OVERHEAD_BYTES`.
+/// A band's raw canvas, its demultiplied copy, and the source image's
+/// row-range decode buffer (`RasterImage::decode_rgba_row_range`) can all be
+/// alive at once, so the remaining per-worker budget is divided across
+/// roughly that many same-order buffers, plus headroom for the eviction
+/// interval.
+fn band_budget(max_memory_mib: Option<u64>, concurrency: usize) -> (usize, u64) {
+    let Some(mib) = max_memory_mib else {
+        return (DEFAULT_MAX_BAND_BYTES, DEFAULT_EVICT_CHUNK_BYTES);
+    };
+    let budget = mib.saturating_mul(1024 * 1024).saturating_sub(BASE_OVERHEAD_BYTES);
+    let per_worker = budget / (concurrency.max(1) as u64);
+    let band_bytes = ((per_worker / 6) as usize).max(4096);
+    let evict_bytes = (per_worker / 4).clamp(1024 * 1024, 128 * 1024 * 1024);
+    (band_bytes, evict_bytes)
+}
+
+/// Wraps a plain file (not stdout, which may be a pipe or terminal rather
+/// than a normal file) so that once `evict_chunk_bytes` have been written,
+/// they're synced to disk and the OS is told to drop them from the page
+/// cache.
+///
+/// Without this, writing a large encoded PNG (a high-DPI poster can run to
+/// hundreds of megabytes or more) leaves all of it resident as dirty (then
+/// clean) page cache by the time the export finishes. A memory-constrained
+/// cgroup charges page cache the same as heap memory, so that cache would
+/// otherwise dominate peak memory regardless of how small
+/// `render_and_encode_png_in_bands` keeps the actual render/encode buffers.
+struct EvictingFileWriter {
+    file: std::fs::File,
+    evict_chunk_bytes: u64,
+    written: u64,
+    evicted: u64,
+}
+
+impl EvictingFileWriter {
+    fn create(path: &Path, evict_chunk_bytes: u64) -> io::Result<Self> {
+        Ok(Self {
+            file: std::fs::File::create(path)?,
+            evict_chunk_bytes,
+            written: 0,
+            evicted: 0,
+        })
+    }
+
+    /// Syncs and evicts everything written so far. Best-effort: an error
+    /// (or running on a platform without `posix_fadvise`) just leaves the
+    /// data cached, which is the pre-existing behavior, not a correctness
+    /// problem.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn evict_written(&mut self) {
+        use std::os::unix::io::AsRawFd;
+
+        if self.file.sync_data().is_err() {
+            return;
+        }
+
+        // SAFETY: `self.file` is a valid, open file descriptor for the
+        // duration of this call. `posix_fadvise` only affects the OS page
+        // cache, never the file's contents or Rust-level memory safety.
+        unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                0,
+                self.written as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+        self.evicted = self.written;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn evict_written(&mut self) {}
+}
+
+impl Write for EvictingFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        if self.written - self.evicted >= self.evict_chunk_bytes {
+            self.evict_written();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Renders a page and encodes it as a PNG, honoring the configured
+/// compression effort, without ever materializing the full-page canvas --
+/// or the full encoded output -- in memory at once.
+///
+/// This reimplements `tiny_skia::Pixmap::encode_png` instead of calling it
+/// directly for two reasons: that method hardcodes the `png` crate's default
+/// compression (`Balanced`, slow for very large pages), and it always
+/// operates on a whole `Pixmap`, which for a large page (e.g. a big poster)
+/// means holding the whole rendered canvas in memory. Instead, render and
+/// stream out one horizontal band at a time via `typst_render::render_band`,
+/// so peak memory is bounded by a single band rather than the full page.
+///
+/// The encoded bytes are streamed straight into `output` rather than
+/// collected into an in-memory buffer first: for a large enough page (e.g. a
+/// high-DPI poster), the encoded PNG itself can be hundreds of megabytes to
+/// low gigabytes, which would otherwise dominate peak memory regardless of
+/// how small the per-band canvas is kept.
+fn render_and_encode_png_in_bands(
+    page: &Page,
+    opts: &RenderOptions,
+    compression: PngCompression,
+    max_memory_mib: Option<u64>,
+    concurrency: usize,
+    output: &Output,
+) -> Result<(), png::EncodingError> {
+    let (band_bytes, evict_bytes) = band_budget(max_memory_mib, concurrency);
+
+    // A plain file gets the page-cache-evicting writer (see
+    // `EvictingFileWriter`); stdout may be a pipe or terminal rather than a
+    // regular file, so it's written as-is.
+    match output {
+        Output::Path(path) => encode_bands(
+            page,
+            opts,
+            compression,
+            band_bytes,
+            EvictingFileWriter::create(path, evict_bytes)?,
+        ),
+        Output::Stdout => encode_bands(page, opts, compression, band_bytes, output.open()?),
+    }
+}
+
+/// Does the actual banded render + PNG encode into `out`, shared between
+/// [`render_and_encode_png_in_bands`]'s file and stdout cases.
+fn encode_bands(
+    page: &Page,
+    opts: &RenderOptions,
+    compression: PngCompression,
+    max_band_bytes: usize,
+    mut out: impl Write,
+) -> Result<(), png::EncodingError> {
+    let (width, height) = typst_render::pixel_dimensions(page, opts);
+    let row_bytes = (width as usize).saturating_mul(4).max(1);
+    let band_rows = if typst_render::uses_relative_paint(page) {
+        // See `uses_relative_paint`: banding a gradient/pattern can shift its
+        // colors slightly due to f32 precision loss, so render such pages as
+        // a single band (the whole page), matching un-banded behavior.
+        height.max(1)
+    } else {
+        ((max_band_bytes / row_bytes) as u32).clamp(1, height.max(1))
+    };
+
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(compression.into());
+    let mut writer = encoder.write_header()?;
+    let mut stream = writer.stream_writer()?;
+
+    let mut y = 0;
+    while y < height {
+        let band_height = band_rows.min(height - y);
+        let band = typst_render::render_band(page, opts, y, band_height);
+        let demultiplied_data = band.take_demultiplied();
+        stream.write_all(&demultiplied_data)?;
+        y += band_height;
+    }
+
+    stream.finish()?;
+
     Ok(())
 }
 
@@ -753,5 +1011,54 @@ impl From<PdfStandard> for typst_pdf::PdfStandard {
             PdfStandard::A_4e => typst_pdf::PdfStandard::A_4e,
             PdfStandard::UA_1 => typst_pdf::PdfStandard::Ua_1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `band_budget` derives byte budgets purely from the memory cap, not
+    /// from any page/asset dimensions, so the same `--max-memory` value
+    /// scales down banding for a huge poster exactly like it would for a
+    /// tiny page: `band_rows = band_bytes / row_bytes` then adapts to
+    /// whatever `row_bytes` (i.e. page width) turns out to be.
+    #[test]
+    fn test_band_budget_scales_with_cap_not_content() {
+        let (default_band, default_evict) = band_budget(None, 1);
+        assert_eq!(default_band, DEFAULT_MAX_BAND_BYTES);
+        assert_eq!(default_evict, DEFAULT_EVICT_CHUNK_BYTES);
+
+        let (small_band, small_evict) = band_budget(Some(128), 1);
+        let (large_band, large_evict) = band_budget(Some(2048), 1);
+        assert!(small_band < large_band, "{small_band} should be < {large_band}");
+        assert!(small_evict < large_evict, "{small_evict} should be < {large_evict}");
+
+        // A cap at or below the base overhead allowance still yields a
+        // usable (if minimal) band -- at least one row -- rather than
+        // zero/underflowing.
+        let (floor_band, floor_evict) = band_budget(Some(1), 1);
+        assert!(floor_band > 0);
+        assert!(floor_evict > 0);
+    }
+
+    /// A cap unset by `--jobs` still bounds *total* memory when multiple
+    /// pages are exported concurrently: each concurrent worker must get a
+    /// proportionally smaller slice of the same overall cap.
+    #[test]
+    fn test_band_budget_scales_with_concurrency() {
+        let (band_1, evict_1) = band_budget(Some(512), 1);
+        let (band_4, evict_4) = band_budget(Some(512), 4);
+        assert!(band_4 < band_1, "{band_4} should be < {band_1}");
+        assert!(evict_4 < evict_1, "{evict_4} should be < {evict_1}");
+        // Roughly a 4x reduction (integer division, so allow some slack).
+        assert!(band_1 / band_4 >= 3, "expected ~4x smaller, got {band_1}/{band_4}");
+
+        // `concurrency == 0` is treated the same as `1` (never divide by
+        // zero / hand out an unbounded budget).
+        assert_eq!(band_budget(Some(512), 0), band_budget(Some(512), 1));
+
+        // `None` (no cap requested) is unaffected by concurrency.
+        assert_eq!(band_budget(None, 4), band_budget(None, 1));
     }
 }

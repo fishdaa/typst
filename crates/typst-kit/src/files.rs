@@ -109,10 +109,22 @@ where
     /// in place with updated data, leading to improved incremental compilation
     /// performance.
     pub fn reset(&mut self) {
-        #[expect(clippy::iter_over_hash_type, reason = "order does not matter")]
-        for slot in self.slots.get_mut().values_mut() {
+        #[allow(clippy::iter_over_hash_type, reason = "order does not matter")]
+        self.slots.get_mut().retain(|_, slot| {
+            // A slot that's already `Empty(None)` going into this reset
+            // hasn't been accessed since the *previous* reset either, and
+            // (per `FileSlot::reset`) has no stale source worth keeping.
+            // Drop it now instead of retaining it forever: without this, a
+            // long-running `watch` session accumulates one entry per
+            // distinct file ever referenced, even for files no longer part
+            // of the document (e.g. a removed `#include` or a swapped
+            // image path).
+            if matches!(slot, FileSlot::Empty(None)) {
+                return false;
+            }
             slot.reset();
-        }
+            true
+        });
     }
 
     /// Access the canonical slot for the given file id.
@@ -346,6 +358,19 @@ impl FsRoot {
     }
 
     /// Loads file data from the given virtual path in this root.
+    ///
+    /// Large files are memory-mapped rather than copied into the heap (see
+    /// [`crate::mmap`]), so their pages can be reclaimed by the OS under
+    /// memory pressure instead of being pinned for the whole compilation.
+    /// This trades away one guarantee a plain read has: truncating or
+    /// overwriting such a file in place (same inode) while it's still
+    /// mapped and being read can crash the process, instead of the read
+    /// simply seeing old or new (but still valid) content. This is a narrow
+    /// risk in practice -- it requires in-place mutation of a large file
+    /// racing a concurrent read of that same file -- and editors/build
+    /// tools overwhelmingly save via atomic rename, which isn't affected
+    /// (the old mapping is over an unlinked inode, already dropped by the
+    /// time a new one is read).
     pub fn load(&self, path: &VirtualPath) -> FileResult<Bytes> {
         // Join the path to the root. If it tries to escape, deny access. Note:
         // It can still escape via symlinks.
@@ -354,7 +379,7 @@ impl FsRoot {
         if fs::metadata(&path).map_err(f)?.is_dir() {
             Err(FileError::IsDirectory)
         } else {
-            fs::read(&path).map(Bytes::new).map_err(f)
+            crate::mmap::read_file(&path).map_err(f)
         }
     }
 }
@@ -403,7 +428,7 @@ mod tests {
             let mut vec = iter
                 .map(|id| id.get().vpath().get_without_slash())
                 .collect::<Vec<_>>();
-            vec.sort_unstable();
+            vec.sort();
             vec
         };
         store.source(id("a.typ")).must_be(A_TEXT);
@@ -415,6 +440,101 @@ mod tests {
         store.source(id("d.typ")).must_be("5");
         store.file(id("e.bin")).must_be(E_TEXT);
         assert_eq!(deps(&mut store), ["d.typ", "e.bin"]);
+    }
+
+    /// Check that a file unaccessed for long enough is dropped from the
+    /// store entirely, instead of accumulating forever.
+    #[test]
+    fn test_file_store_evicts_stale_slots() {
+        let mut store = FileStore::new(TestLoader(1));
+        store.source(id("a.typ")).must_be(A_TEXT);
+        store.source(id("d.typ")).must_be("1");
+        assert_eq!(store.slots.lock().len(), 2);
+
+        // First reset: nothing is dropped yet. Both slots transition from
+        // `Parsed` to `Empty(Some(source))`, keeping a stale, reusable
+        // `Source` from before this reset.
+        store.reset();
+        assert_eq!(store.slots.lock().len(), 2);
+
+        // Access only "d.typ" again; "a.typ" is now unaccessed for a whole
+        // cycle, with a stale source it never got to reuse.
+        store.source(id("d.typ")).must_be("1");
+
+        // Second reset: "a.typ" is still present, but its `reset()` call
+        // (per `FileSlot::reset`, which only preserves a stale source when
+        // coming from `Parsed`) now discards that unused stale source,
+        // leaving it `Empty(None)`.
+        store.reset();
+        assert_eq!(store.slots.lock().len(), 2);
+
+        store.source(id("d.typ")).must_be("1");
+
+        // Third reset: "a.typ" was already `Empty(None)` going into it --
+        // unaccessed for two full cycles with nothing left to reuse -- so it
+        // finally gets dropped.
+        store.reset();
+        assert_eq!(store.slots.lock().len(), 1);
+    }
+
+    /// `FsRoot::load` goes through `crate::mmap::read_file` (see that
+    /// module's own unit tests for the threshold/fallback logic in
+    /// isolation) -- these exercise it end-to-end via real files on disk,
+    /// including the below/above-mmap-threshold boundary and the existing
+    /// directory-rejection behavior.
+    mod fs_root {
+        use std::fs;
+
+        use super::*;
+
+        fn root(dir: &std::path::Path) -> FsRoot {
+            FsRoot::new(dir.to_path_buf())
+        }
+
+        fn vpath(name: &str) -> VirtualPath {
+            VirtualPath::new(name).unwrap()
+        }
+
+        #[test]
+        fn test_fs_root_load_small_file() {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("small.txt"), "hello").unwrap();
+            let bytes = root(dir.path()).load(&vpath("small.txt")).unwrap();
+            assert_eq!(bytes.as_slice(), b"hello");
+        }
+
+        #[test]
+        fn test_fs_root_load_large_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let content = vec![0x17u8; 2 * 1024 * 1024];
+            fs::write(dir.path().join("large.bin"), &content).unwrap();
+            let bytes = root(dir.path()).load(&vpath("large.bin")).unwrap();
+            assert_eq!(bytes.as_slice(), content.as_slice());
+        }
+
+        #[test]
+        fn test_fs_root_load_empty_file() {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("empty.bin"), []).unwrap();
+            let bytes = root(dir.path()).load(&vpath("empty.bin")).unwrap();
+            assert_eq!(bytes.as_slice(), b"");
+        }
+
+        #[test]
+        fn test_fs_root_load_missing_file() {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(root(dir.path()).load(&vpath("missing.bin")).is_err());
+        }
+
+        #[test]
+        fn test_fs_root_load_directory_is_rejected() {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir(dir.path().join("subdir")).unwrap();
+            assert_eq!(
+                root(dir.path()).load(&vpath("subdir")),
+                Err(FileError::IsDirectory)
+            );
+        }
     }
 
     const A_TEXT: &str = "Hello from A";

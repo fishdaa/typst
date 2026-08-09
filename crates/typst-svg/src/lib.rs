@@ -222,6 +222,12 @@ struct SVGRenderer<'a> {
     /// different transforms. Therefore this allows us to reuse the same gradient
     /// multiple times.
     tiling_refs: Deduplicator<TilingRef>,
+    /// These are the actual images being written into the SVG file's
+    /// `<defs>`, deduplicated by content so that an image used multiple
+    /// times (e.g. a repeated logo or background) is embedded as base64
+    /// only once instead of once per use. Each use site instead references
+    /// it with a `<use>` element.
+    images: Deduplicator<WebImage>,
 }
 
 /// Contextual information for rendering.
@@ -279,6 +285,7 @@ impl<'a> SVGRenderer<'a> {
             conic_subgradients: Deduplicator::new('s'),
             tilings: Deduplicator::new('t'),
             tiling_refs: Deduplicator::new('p'),
+            images: Deduplicator::new('i'),
         }
     }
 
@@ -416,6 +423,38 @@ impl<'a> SVGRenderer<'a> {
         self.write_subgradients(&mut svg);
         self.write_tilings(&mut svg);
         self.write_tiling_refs(&mut svg);
+        self.write_image_defs(&mut svg);
+    }
+
+    /// Build the deduplicated image definitions: one base64-embedded
+    /// `<image>` per distinct image, wrapped in a `<symbol>` and referenced
+    /// from use sites via `<use>` instead of each site embedding its own
+    /// copy of the data.
+    ///
+    /// This wraps each image in a `<symbol>` rather than referencing the
+    /// `<image>` directly: unlike `<image>`, `<use>` overriding a
+    /// `<symbol>`'s `width`/`height` is unambiguously specified (and
+    /// supported by every renderer we tested), going back to SVG 1.1.
+    fn write_image_defs(&self, svg: &mut SvgElem) {
+        if self.images.is_empty() {
+            return;
+        }
+
+        let mut defs = svg.elem("defs");
+        for (id, image) in self.images.iter() {
+            defs.elem("symbol")
+                .attr("id", id)
+                .attr_with("viewBox", |attr| attr.push_nums([0.0, 0.0, 1.0, 1.0]))
+                .attr("preserveAspectRatio", "none")
+                .with(|symbol| {
+                    symbol
+                        .elem("image")
+                        .attr("xlink:href", image.to_base64_url().as_str())
+                        .attr("width", 1.0)
+                        .attr("height", 1.0)
+                        .attr("preserveAspectRatio", "none");
+                });
+        }
     }
 
     /// Build the clip path definitions.

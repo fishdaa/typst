@@ -255,8 +255,7 @@ pub fn to_sk_paint<'a>(
                     .post_concat(state.transform.invert().unwrap()),
             };
 
-            let canvas = render_tiling_frame(&state, tilings);
-            *pixmap = Some(Arc::new(canvas));
+            *pixmap = Some(render_tiling_frame(&state, tilings));
 
             let base_offset = match relative {
                 RelativeTo::Self_ => {
@@ -293,17 +292,31 @@ pub fn to_sk_color_u8(color: ProcessColor) -> sk::ColorU8 {
     sk::ColorU8::from_rgba(r, g, b, a)
 }
 
-pub fn render_tiling_frame(state: &State, tilings: &Tiling) -> sk::Pixmap {
+pub fn render_tiling_frame(state: &State, tilings: &Tiling) -> Arc<sk::Pixmap> {
+    render_tiling_frame_cached(tilings, state.pixel_per_pt.to_bits())
+}
+
+/// Renders one tile of a tiling pattern into its own small canvas, cached by
+/// tiling content and scale.
+///
+/// Unlike gradients (cheap to resample), rendering a tiling means re-walking
+/// its whole frame (`render_frame`), which can be arbitrarily expensive.
+/// Without this cache, every shape or glyph filled with the same tiling
+/// pattern re-rendered that frame from scratch -- e.g. a hatched table with
+/// many cells sharing one tiling pattern would redo this work per cell.
+#[comemo::memoize]
+fn render_tiling_frame_cached(tilings: &Tiling, pixel_per_pt_bits: u32) -> Arc<sk::Pixmap> {
+    let pixel_per_pt = f32::from_bits(pixel_per_pt_bits);
     let size = tilings.size() + tilings.spacing();
     let mut canvas = sk::Pixmap::new(
-        (size.x.to_f32() * state.pixel_per_pt).round() as u32,
-        (size.y.to_f32() * state.pixel_per_pt).round() as u32,
+        (size.x.to_f32() * pixel_per_pt).round() as u32,
+        (size.y.to_f32() * pixel_per_pt).round() as u32,
     )
     .unwrap();
 
     // Render the tilings into a new canvas.
-    let ts = sk::Transform::from_scale(state.pixel_per_pt, state.pixel_per_pt);
-    let temp_state = State::new(tilings.size(), ts, state.pixel_per_pt);
+    let ts = sk::Transform::from_scale(pixel_per_pt, pixel_per_pt);
+    let temp_state = State::new(tilings.size(), ts, pixel_per_pt);
     crate::render_frame(&mut canvas, temp_state, tilings.frame());
-    canvas
+    Arc::new(canvas)
 }

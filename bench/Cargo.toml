@@ -1,0 +1,18 @@
+[package]
+name = "typst-bench"
+version = { workspace = true }
+rust-version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+publish = false
+
+[[bin]]
+name = "typst-bench"
+path = "src/main.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dependencies]
+png = { workspace = true }
+tempfile = { workspace = true }

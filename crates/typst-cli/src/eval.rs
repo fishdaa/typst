@@ -99,6 +99,34 @@ pub fn eval(command: &'static EvalCommand) -> HintedStrResult<()> {
     Ok(())
 }
 
+/// Prints the output value of `typst eval`.
+fn print_eval_result(
+    value: &Value,
+    format: EvalSerializationFormat,
+    pretty: bool,
+) -> HintedStrResult<()> {
+    match format {
+        EvalSerializationFormat::Json => {
+            println!("{}", crate::serialize(value, SerializationFormat::Json, pretty)?);
+        }
+        EvalSerializationFormat::Yaml => {
+            println!("{}", crate::serialize(value, SerializationFormat::Yaml, pretty)?);
+        }
+        EvalSerializationFormat::Raw => {
+            let bytes = match value {
+                Value::Str(string) => string.as_bytes(),
+                Value::Bytes(bytes) => bytes,
+                _ => bail!(
+                    "cannot print {} in raw format", value.ty();
+                    hint: "`--format=raw` only supports strings and bytes"
+                ),
+            };
+            stdout().lock().write_all(bytes).expect("failed to write eval output");
+        }
+    }
+    Ok(())
+}
+
 /// Evaluate the input expression in [`SyntaxMode::Code`] and with no scope.
 fn evaluate_expression(
     expression: &str,
@@ -124,34 +152,6 @@ fn evaluate_expression(
         SyntaxMode::Code,
         Scope::default(),
     )
-}
-
-/// Prints the output value of `typst eval`.
-fn print_eval_result(
-    value: &Value,
-    format: EvalSerializationFormat,
-    pretty: bool,
-) -> HintedStrResult<()> {
-    match format {
-        EvalSerializationFormat::Json => {
-            println!("{}", crate::serialize(&value, SerializationFormat::Json, pretty)?);
-        }
-        EvalSerializationFormat::Yaml => {
-            println!("{}", crate::serialize(&value, SerializationFormat::Yaml, pretty)?);
-        }
-        EvalSerializationFormat::Raw => {
-            let bytes = match value {
-                Value::Str(string) => string.as_bytes(),
-                Value::Bytes(bytes) => bytes,
-                _ => bail!(
-                    "cannot print {} in raw format", value.ty();
-                    hint: "`--format=raw` only supports strings and bytes"
-                ),
-            };
-            stdout().lock().write_all(bytes).expect("failed to write eval output");
-        }
-    }
-    Ok(())
 }
 
 /// Static [`FileId`] for an input expression. This allows giving accurate

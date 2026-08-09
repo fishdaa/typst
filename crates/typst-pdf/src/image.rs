@@ -88,69 +88,177 @@ struct PdfRasterImage(Arc<PdfRasterImageInner>);
 struct PdfRasterImageInner {
     /// The original, underlying raster image.
     raster: RasterImage,
-    /// The alpha channel of the raster image, if existing.
-    alpha_channel: OnceLock<Option<Vec<u8>>>,
-    /// A (potentially) converted version of the dynamic image stored `raster` that is
-    /// guaranteed to either be in luma8 or rgb8, and thus can be used for the
-    /// `color_channel` method of `CustomImage`.
-    actual_dynamic: OnceLock<Arc<DynamicImage>>,
+    /// The color and alpha channels split out of `raster`, computed together
+    /// in a single pass (see [`derive_channels`]).
+    channels: OnceLock<Channels>,
 }
 
 impl PdfRasterImage {
     /// Wraps a raster image.
     pub fn new(raster: RasterImage) -> Self {
-        Self(Arc::new(PdfRasterImageInner {
-            raster,
-            alpha_channel: OnceLock::new(),
-            actual_dynamic: OnceLock::new(),
-        }))
+        Self(Arc::new(PdfRasterImageInner { raster, channels: OnceLock::new() }))
     }
 }
 
 impl Hash for PdfRasterImage {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // `alpha_channel` and `actual_dynamic` are generated from the underlying `RasterImage`,
-        // so this is enough. Since `raster` is prehashed, this is also very cheap.
+        // `channels` is generated from the underlying `RasterImage`, so this
+        // is enough. Since `raster` is prehashed, this is also very cheap.
         self.0.raster.hash(state);
+    }
+}
+
+/// A color buffer for [`Channels`], avoiding a copy for the common case
+/// where `raster.dynamic()` is already exactly the right pixel type (a plain
+/// refcount bump via `Arc::clone`).
+enum ColorBuf {
+    Dynamic(Arc<DynamicImage>),
+    Owned(Vec<u8>),
+}
+
+impl ColorBuf {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            ColorBuf::Dynamic(dynamic) => dynamic.as_bytes(),
+            ColorBuf::Owned(buf) => buf,
+        }
+    }
+}
+
+/// The color and alpha channels needed to embed a [`RasterImage`] in a PDF.
+struct Channels {
+    color: ColorBuf,
+    is_rgb: bool,
+    alpha: Option<Vec<u8>>,
+    /// Whether `raster`'s ICC profile (if any) still applies to `color`, or
+    /// was invalidated by a lossy bit-depth reduction while deriving it.
+    icc_valid: bool,
+}
+
+/// Splits a raster image into a color channel (guaranteed luma8 or rgb8, for
+/// `CustomImage::color_channel`) and an optional alpha channel, in a single
+/// pass over the source pixels where possible.
+///
+/// For a qualifying PNG (see [`RasterImage::for_each_rgba_row`]), this
+/// decodes directly via the row-streaming path instead of
+/// [`RasterImage::dynamic`], so no whole-image interleaved RGBA buffer is
+/// created while `color`/`alpha` are built. Otherwise (non-PNG, interlaced,
+/// or EXIF-rotated images), this falls back to `raster.dynamic()`.
+///
+/// Splitting used to happen as two independent passes -- `color_channel`
+/// building its converted buffer via `to_rgb8()`/`to_luma8()`, and
+/// `alpha_channel` separately re-walking every pixel via the `pixels()`
+/// iterator, which visited the source buffer twice and paid for
+/// `pixels()`'s per-pixel bounds-checked indexing. Both are now produced in
+/// one direct pass over the raw byte slice instead, for the same result.
+fn derive_channels(raster: &RasterImage) -> Channels {
+    if raster.exif_rotation().is_none()
+        && matches!(raster.format(), RasterFormat::Exchange(ExchangeFormat::Png))
+    {
+        let pixels = raster.width() as usize * raster.height() as usize;
+        let mut color = Vec::with_capacity(pixels * 3);
+        let mut alpha = raster.has_alpha().then(|| Vec::with_capacity(pixels));
+        if raster
+            .for_each_rgba_row(0, raster.height(), |_, row| {
+                for px in row.chunks_exact(4) {
+                    color.extend_from_slice(&px[..3]);
+                    if let Some(alpha) = &mut alpha {
+                        alpha.push(px[3]);
+                    }
+                }
+            })
+            .is_some()
+        {
+            return Channels {
+                color: ColorBuf::Owned(color),
+                is_rgb: true,
+                alpha,
+                icc_valid: raster.is_native_8bit(),
+            };
+        }
+    }
+
+    let dynamic = raster.dynamic();
+    match dynamic.as_ref() {
+        // Pure luma8 or rgb8 image: no alpha, use it directly.
+        DynamicImage::ImageLuma8(_) => Channels {
+            color: ColorBuf::Dynamic(dynamic.clone()),
+            is_rgb: false,
+            alpha: None,
+            icc_valid: true,
+        },
+        DynamicImage::ImageRgb8(_) => Channels {
+            color: ColorBuf::Dynamic(dynamic.clone()),
+            is_rgb: true,
+            alpha: None,
+            icc_valid: true,
+        },
+        // Rgba8: split into rgb8 + alpha in one pass.
+        DynamicImage::ImageRgba8(buf) => {
+            let pixels = buf.width() as usize * buf.height() as usize;
+            let mut rgb = Vec::with_capacity(pixels * 3);
+            let mut alpha = Vec::with_capacity(pixels);
+            for px in buf.as_raw().chunks_exact(4) {
+                rgb.extend_from_slice(&px[..3]);
+                alpha.push(px[3]);
+            }
+            Channels {
+                color: ColorBuf::Owned(rgb),
+                is_rgb: true,
+                alpha: Some(alpha),
+                icc_valid: true,
+            }
+        }
+        // LumaA8: split into luma8 + alpha in one pass.
+        DynamicImage::ImageLumaA8(buf) => {
+            let pixels = buf.width() as usize * buf.height() as usize;
+            let mut luma = Vec::with_capacity(pixels);
+            let mut alpha = Vec::with_capacity(pixels);
+            for px in buf.as_raw().chunks_exact(2) {
+                luma.push(px[0]);
+                alpha.push(px[1]);
+            }
+            Channels {
+                color: ColorBuf::Owned(luma),
+                is_rgb: false,
+                alpha: Some(alpha),
+                icc_valid: true,
+            }
+        }
+        // Anything else (e.g. 16-bit-per-channel): fall back to `image`'s
+        // general conversion, which handles bit-depth downsampling. The ICC
+        // profile (if any) is invalidated by that conversion.
+        _ => {
+            let channel_count = dynamic.color().channel_count();
+            let is_rgb = channel_count > 2;
+            let color = if is_rgb {
+                ColorBuf::Owned(dynamic.to_rgb8().into_raw())
+            } else {
+                ColorBuf::Owned(dynamic.to_luma8().into_raw())
+            };
+            let alpha = dynamic.color().has_alpha().then(|| {
+                dynamic.pixels().map(|(_, _, Rgba([_, _, _, a]))| a).collect()
+            });
+            Channels { color, is_rgb, alpha, icc_valid: false }
+        }
     }
 }
 
 impl CustomImage for PdfRasterImage {
     fn color_channel(&self) -> &[u8] {
         self.0
-            .actual_dynamic
-            .get_or_init(|| {
-                let dynamic = self.0.raster.dynamic();
-                let channel_count = dynamic.color().channel_count();
-
-                match (dynamic.as_ref(), channel_count) {
-                    // Pure luma8 or rgb8 image, can use it directly.
-                    (DynamicImage::ImageLuma8(_), _) => dynamic.clone(),
-                    (DynamicImage::ImageRgb8(_), _) => dynamic.clone(),
-                    // Grey-scale image, convert to luma8.
-                    (_, 1 | 2) => Arc::new(DynamicImage::ImageLuma8(dynamic.to_luma8())),
-                    // Anything else, convert to rgb8.
-                    _ => Arc::new(DynamicImage::ImageRgb8(dynamic.to_rgb8())),
-                }
-            })
+            .channels
+            .get_or_init(|| derive_channels(&self.0.raster))
+            .color
             .as_bytes()
     }
 
     fn alpha_channel(&self) -> Option<&[u8]> {
         self.0
-            .alpha_channel
-            .get_or_init(|| {
-                self.0.raster.dynamic().color().has_alpha().then(|| {
-                    self.0
-                        .raster
-                        .dynamic()
-                        .pixels()
-                        .map(|(_, _, Rgba([_, _, _, a]))| a)
-                        .collect()
-                })
-            })
-            .as_ref()
-            .map(|v| &**v)
+            .channels
+            .get_or_init(|| derive_channels(&self.0.raster))
+            .alpha
+            .as_deref()
     }
 
     fn bits_per_component(&self) -> BitsPerComponent {
@@ -162,28 +270,13 @@ impl CustomImage for PdfRasterImage {
     }
 
     fn icc_profile(&self) -> Option<&[u8]> {
-        if matches!(
-            self.0.raster.dynamic().as_ref(),
-            DynamicImage::ImageLuma8(_)
-                | DynamicImage::ImageLumaA8(_)
-                | DynamicImage::ImageRgb8(_)
-                | DynamicImage::ImageRgba8(_)
-        ) {
-            self.0.raster.icc().map(|b| b.as_bytes())
-        } else {
-            // In all other cases, the dynamic will be converted into RGB8 or LUMA8, so the ICC
-            // profile may become invalid, and thus we don't include it.
-            None
-        }
+        let channels = self.0.channels.get_or_init(|| derive_channels(&self.0.raster));
+        channels.icc_valid.then(|| self.0.raster.icc().map(|b| b.as_bytes())).flatten()
     }
 
     fn color_space(&self) -> ImageColorspace {
-        // Remember that we convert all images to either RGB or luma.
-        if self.0.raster.dynamic().color().has_color() {
-            ImageColorspace::Rgb
-        } else {
-            ImageColorspace::Luma
-        }
+        let channels = self.0.channels.get_or_init(|| derive_channels(&self.0.raster));
+        if channels.is_rgb { ImageColorspace::Rgb } else { ImageColorspace::Luma }
     }
 }
 
@@ -205,6 +298,16 @@ fn convert_raster(
             icc_profile.map(|i| i.into()),
             interpolate,
         )
+    } else if matches!(raster.format(), RasterFormat::Exchange(ExchangeFormat::Png))
+        && raster.exif_rotation().is_none()
+        && raster.icc().is_none()
+    {
+        // Keep ordinary PNGs compressed and deferred all the way through PDF
+        // serialization. The custom-image path below decodes the whole image
+        // and retains separate color/alpha buffers, which is unnecessarily
+        // expensive for a PNG that krilla can embed directly.
+        let image_data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(raster.data().clone());
+        krilla::image::Image::from_png(image_data.into(), interpolate)
     } else {
         krilla::image::Image::from_custom(PdfRasterImage::new(raster), interpolate)
     }

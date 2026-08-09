@@ -30,6 +30,127 @@ as LaTeX while being much easier to learn and use. Typst has:
 - Fast compile times thanks to incremental compilation
 - Friendly error messages in case something goes wrong
 
+## Why this fork exists
+
+This is a production-focused fork of [Typst](https://github.com/typst/typst).
+The service that motivated it runs Typst in serverless workers with a strict
+memory limit, while compiling documents that contain large raster and SVG
+assets. Upstream's normal image path is excellent for ordinary documents, but
+a large full-bleed asset can make several full-size copies live at once: the
+decoded source, a render texture, the page canvas, and the encoded output.
+That is enough to make an otherwise valid document exceed a small worker's
+RAM limit.
+
+The fork therefore concentrates on reducing peak memory rather than changing
+Typst's language or document output. Small assets keep the established
+paths, where they are already fast; large assets get bounded-memory paths
+instead — see the scenario table below for exactly which path applies where
+and why. The full change set is in the commit history (`git log
+upstream/main..HEAD`); the intended end state is to upstream it in focused,
+reviewable pieces and merge the fork back into the main Typst repository.
+
+The additional CLI controls are:
+
+```sh
+# Bound PNG export memory (MiB); lower values trade speed for RAM.
+typst compile --max-memory 512 --ppi 72 poster.typ poster.png
+
+# Choose a faster PNG compression effort for large exports.
+typst compile --png-compression fastest poster.typ poster.png
+```
+
+`--max-memory` is a PNG-export budget for the render/encode portion of a
+compile, not a hard cgroup guarantee: document layout, fonts, and process
+overhead still need room. For serverless deployment, leave headroom between
+the flag and the worker's actual limit.
+
+## Large-asset benchmarks
+
+The numbers below were measured with [`bench/`](bench/) (default
+7200×18000-pixel poster) comparing this checkout against upstream `a51e0280`
+built from a clean worktree, both release builds, on the same host back to
+back. Peak RSS is process resident memory; results vary with OS, allocator,
+fonts, and filesystem cache — regenerate with the command further down
+rather than trusting these across machines.
+
+**Time**
+
+| Scenario | Stock | Fork |
+| --- | ---: | ---: |
+| Opaque PNG export | 2.43 s | 849 ms |
+| Alpha PNG export | 2.57 s | 711 ms |
+| SVG export | 2.02 s | 324 ms |
+
+**Peak RSS**
+
+| Scenario | Stock | Fork |
+| --- | ---: | ---: |
+| Opaque PNG export | 1874 MiB | 51 MiB |
+| Alpha PNG export | 1998 MiB | 35 MiB |
+| SVG export | 1510 MiB | 42 MiB |
+
+**Output size**
+
+| Scenario | Stock | Fork |
+| --- | ---: | ---: |
+| Opaque PNG export | 536 KiB | 2.4 MiB |
+| Alpha PNG export | 536 KiB | 2.4 MiB |
+| SVG export | 613 KiB | 2.5 MiB |
+
+Output size is the odd one out: the fork's PNG is larger, not smaller — see
+below.
+
+Two fork-only variants isolate specific effects, both on the opaque fixture:
+
+| Variant | Time | Peak RSS | Output size |
+| --- | ---: | ---: | ---: |
+| `--max-memory 512` | 872 ms | 168 MiB | 2.4 MiB |
+| `--png-compression high` (matches stock's ~536 KiB output size) | 1.45 s | 51 MiB | 527 KiB |
+
+The last row matters: the fork's default `--png-compression` is `fast`,
+which is itself faster than stock's (fixed, harder) compression — some of
+the plain time gap above is that default, not only the rendering-path
+rewrite. At matched output size, the fork is still ~1.7× faster and uses
+~37× less memory, so the memory result holds independent of the compression
+default.
+
+The fork's behavior is deliberately scenario-dependent:
+
+| Scenario | Stock path | Fork path | Expected benefit |
+| --- | --- | --- | --- |
+| Opaque, native-resolution raster | Full texture plus compositing | Direct blit into the destination | Avoids a full-size texture |
+| Alpha raster at native resolution | General image compositing | Alpha-aware direct path when safe; fallback otherwise | Avoids unnecessary conversion copies |
+| Transformed raster | General resampling path | Specialized blitting/resampling paths | Smaller transient buffers |
+| Large SVG | Rasterize a full placed texture | Render directly into the destination canvas | Memory follows the destination/band |
+| Small SVG | Texture path | Existing texture path | Keeps the fast ordinary case |
+| Large PNG export | Full page canvas and encoded output | Streamed horizontal bands and output | Peak memory is independent of page height |
+| Large source file | Heap-backed file bytes | Memory-mapped file bytes | Lets the OS reclaim clean pages under pressure |
+
+Run the reproducible comparison in [`bench/`](bench/). It generates
+deterministic fixtures, measures wall time and peak RSS for the same
+scenarios with an upstream binary and this fork, and prints a human-readable
+comparison table. The harness intentionally takes binaries as arguments so a
+comparison can be made against any pinned upstream commit, not an
+accidentally different local build:
+
+```sh
+cargo build --release
+cargo run --release -p typst-bench -- \
+  /path/to/upstream/target/release/typst \
+  target/release/typst
+```
+
+The upstream binary is run without fork-only flags; the constrained fork case
+uses `--max-memory 512`. See the harness README for fixture sizes, system
+requirements, and how to pin `upstream/main` before building the baseline.
+
+The implementation-level budget checks are ordinary Rust tests and do not
+require the large fixture:
+
+```sh
+cargo test -p typst-cli --bin typst band_budget
+```
+
 This repository contains the Typst compiler and its CLI, which is everything you
 need to compile Typst documents locally. For the best writing experience,
 consider signing up to our [collaborative online editor][app] for free.

@@ -4,10 +4,12 @@
 //! [from system](system) and can also serve standard [embedded] fonts.
 
 use std::any::Any;
+#[cfg(all(feature = "scan-fonts", any(target_os = "windows", target_os = "macos")))]
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+#[cfg(feature = "embedded-fonts")]
 use typst_library::foundations::Bytes;
 use typst_library::text::{Font, FontBook, FontInfo};
 use typst_utils::LazyHash;
@@ -111,8 +113,8 @@ impl FontSource for Font {
 impl FontSource for FontPath {
     fn load(&self) -> Option<Font> {
         let _scope = typst_timing::TimingScope::new("load font");
-        let data = fs::read(&self.path).ok()?;
-        Font::new(Bytes::new(data), self.index)
+        let data = crate::mmap::read_file(&self.path).ok()?;
+        Font::new(data, self.index)
     }
 }
 

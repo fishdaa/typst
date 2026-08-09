@@ -101,7 +101,14 @@ impl GlyphFragment {
         Some(glyph)
     }
 
-    #[comemo::memoize]
+    /// Not memoized (unlike `base`, which this calls): `stretch` varies
+    /// almost continuously across a document (every fraction bar, root, or
+    /// accent typically has a slightly different target width), so caching
+    /// on it directly would grow a cache entry per occurrence rather than
+    /// per unique glyph, without saving meaningful work -- the actually
+    /// expensive part, shaping, happens in the memoized `base` call below;
+    /// `decide` and the fallback-retry loop here are cheap comparisons and
+    /// (on a cache hit) comemo lookups, not re-shaping.
     fn planned(
         world: Tracked<dyn World + '_>,
         styles: StyleChain,
