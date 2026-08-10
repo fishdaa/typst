@@ -573,7 +573,8 @@ fn try_blit_resized_axis_aligned(
 ///
 /// Returns `None` (with no side effects) whenever a precondition doesn't
 /// hold (not a raster image, or the source doesn't qualify for
-/// [`RasterImage::decode_rgba_row_range`] -- interlaced, EXIF-rotated, or
+/// [`typst_library::visualize::RasterImage::decode_rgba_row_range`] --
+/// interlaced, EXIF-rotated, or
 /// non-PNG), so callers fall back to the general path unchanged.
 fn try_blit_resized_general(
     canvas: &mut sk::Pixmap,

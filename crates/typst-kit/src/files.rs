@@ -360,7 +360,7 @@ impl FsRoot {
     /// Loads file data from the given virtual path in this root.
     ///
     /// Large files are memory-mapped rather than copied into the heap (see
-    /// [`crate::mmap`]), so their pages can be reclaimed by the OS under
+    /// the memory-mapped loader), so their pages can be reclaimed by the OS under
     /// memory pressure instead of being pinned for the whole compilation.
     /// This trades away one guarantee a plain read has: truncating or
     /// overwriting such a file in place (same inode) while it's still
