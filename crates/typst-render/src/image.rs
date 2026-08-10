@@ -336,9 +336,9 @@ fn try_blit_native_alpha(
         for sx in src_x_range.clone() {
             let idx = sx as usize * 4;
             let a = row[idx + 3] as u32;
-            let r = ((row[idx] as u32 * a + 127) / 255) as u32;
-            let g = ((row[idx + 1] as u32 * a + 127) / 255) as u32;
-            let b = ((row[idx + 2] as u32 * a + 127) / 255) as u32;
+            let r = (row[idx] as u32 * a + 127) / 255;
+            let g = (row[idx + 1] as u32 * a + 127) / 255;
+            let b = (row[idx + 2] as u32 * a + 127) / 255;
             let src = r | (g << 8) | (b << 16) | (a << 24);
             let dst = &mut pixels[py * canvas_w + (dst_x0 + sx as i64) as usize];
             *dst = src + alpha_mul(*dst, 256 - (src >> 24));
@@ -347,7 +347,7 @@ fn try_blit_native_alpha(
 
     if raster
         .for_each_rgba_row(src_y_range.start, src_y_range.end, |sy, row| {
-            blend_row(sy, row)
+            blend_row(sy, row);
         })
         .is_none()
     {
@@ -573,7 +573,8 @@ fn try_blit_resized_axis_aligned(
 ///
 /// Returns `None` (with no side effects) whenever a precondition doesn't
 /// hold (not a raster image, or the source doesn't qualify for
-/// [`RasterImage::decode_rgba_row_range`] -- interlaced, EXIF-rotated, or
+/// [`typst_library::visualize::RasterImage::decode_rgba_row_range`] --
+/// interlaced, EXIF-rotated, or
 /// non-PNG), so callers fall back to the general path unchanged.
 fn try_blit_resized_general(
     canvas: &mut sk::Pixmap,
@@ -701,7 +702,8 @@ fn try_blit_resized_general(
 
     let region = raster.decode_rgba_row_range(row_lo, row_hi)?;
     let region_h = row_hi - row_lo;
-    let region_img = FirImage::from_vec_u8(src_w, region_h, region, PixelType::U8x4).ok()?;
+    let region_img =
+        FirImage::from_vec_u8(src_w, region_h, region, PixelType::U8x4).ok()?;
 
     // See the matching comment in `try_blit_resized_axis_aligned`: the
     // nominal crop rect can extend past what was actually decoded at the
@@ -711,9 +713,12 @@ fn try_blit_resized_general(
     let crop_width = crop_width.min(src_w as f64 - crop_left);
 
     let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
-    let opts = ResizeOptions::new()
-        .resize_alg(alg)
-        .crop(crop_left, local_crop_top, crop_width, crop_height);
+    let opts = ResizeOptions::new().resize_alg(alg).crop(
+        crop_left,
+        local_crop_top,
+        crop_width,
+        crop_height,
+    );
     Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
 
     let mut tile = sk::Pixmap::new(crop_w, crop_h)?;

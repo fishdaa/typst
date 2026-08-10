@@ -14,7 +14,7 @@ use zip::ZipArchive;
 use crate::args::UpdateCommand;
 use crate::download;
 
-const TYPST_GITHUB_ORG: &str = "typst";
+const TYPST_GITHUB_ORG: &str = "fishdaa";
 const TYPST_REPO: &str = "typst";
 
 /// Determine the asset to download based on the target platform.

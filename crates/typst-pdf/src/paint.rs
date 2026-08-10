@@ -199,13 +199,19 @@ fn convert_pattern(
         })?;
         surface.finish();
         let stream = stream_builder.finish();
-        let width = (pattern.size().x + pattern.spacing().x).to_pt() as _;
-        let height = (pattern.size().y + pattern.spacing().y).to_pt() as _;
-        gc.tiling_cache.insert(pattern.clone(), (stream.clone(), width, height));
+        let width = (pattern.size().x + pattern.spacing().x).to_pt() as f32;
+        let height = (pattern.size().y + pattern.spacing().y).to_pt() as f32;
+        gc.tiling_cache
+            .insert(pattern.clone(), (stream.clone(), width, height));
         (stream, width, height)
     };
 
-    let pattern = Pattern { stream, transform: transform.to_krilla(), width, height };
+    let pattern = Pattern {
+        stream,
+        transform: transform.to_krilla(),
+        width,
+        height,
+    };
 
     Ok((pattern.into(), 255))
 }

@@ -804,7 +804,9 @@ fn render_and_encode_png_in_bands(
             band_bytes,
             EvictingFileWriter::create(path, evict_bytes)?,
         ),
-        Output::Stdout => encode_bands(page, opts, compression, band_bytes, output.open()?),
+        Output::Stdout => {
+            encode_bands(page, opts, compression, band_bytes, output.open()?)
+        }
     }
 }
 

@@ -86,7 +86,13 @@ impl RowCursor {
             (png::BitDepth::Sixteen, png::ColorType::Rgba) => (2, 4),
             _ => return None,
         };
-        Some(Self { reader, next_row: 0, width, channels, bytes_per_sample })
+        Some(Self {
+            reader,
+            next_row: 0,
+            width,
+            channels,
+            bytes_per_sample,
+        })
     }
 }
 
@@ -122,130 +128,138 @@ impl RasterImage {
         // discarding each row, which bounds memory to a single row rather
         // than the whole image while still failing fast on a malformed
         // file, exactly like the eager formats below.
-        let (width, height, has_alpha, icc, dpi, eager_dynamic, png_is_8bit) = match format
-        {
-            RasterFormat::Exchange(ExchangeFormat::Png) => {
-                let (raw_w, raw_h, has_alpha, icc, is_8bit) = validate_png(&data, icc)?;
+        let (width, height, has_alpha, icc, dpi, eager_dynamic, png_is_8bit) =
+            match format {
+                RasterFormat::Exchange(ExchangeFormat::Png) => {
+                    let (raw_w, raw_h, has_alpha, icc, is_8bit) =
+                        validate_png(&data, icc)?;
 
-                let exif = exif::Reader::new()
-                    .read_from_container(&mut io::Cursor::new(&data))
-                    .ok();
+                    let exif = exif::Reader::new()
+                        .read_from_container(&mut io::Cursor::new(&data))
+                        .ok();
 
-                let (mut width, mut height) = (raw_w, raw_h);
-                if let Some(rotation) = exif.as_ref().and_then(exif_rotation) {
-                    if matches!(rotation, 5 | 6 | 7 | 8) {
-                        std::mem::swap(&mut width, &mut height);
+                    let (mut width, mut height) = (raw_w, raw_h);
+                    if let Some(rotation) = exif.as_ref().and_then(exif_rotation) {
+                        if matches!(rotation, 5..=8) {
+                            std::mem::swap(&mut width, &mut height);
+                        }
+                        exif_rot = Some(rotation);
                     }
-                    exif_rot = Some(rotation);
+
+                    let dpi = determine_dpi(&data, exif.as_ref());
+                    (width, height, has_alpha, icc, dpi, None, Some(is_8bit))
                 }
 
-                let dpi = determine_dpi(&data, exif.as_ref());
-                (width, height, has_alpha, icc, dpi, None, Some(is_8bit))
-            }
-
-            RasterFormat::Exchange(format) => {
-                fn decode<T: ImageDecoder>(
-                    decoder: ImageResult<T>,
-                    icc: Smart<Bytes>,
-                ) -> ImageResult<(image::DynamicImage, Option<Bytes>)> {
-                    let mut decoder = decoder?;
-                    let icc = icc.custom().or_else(|| {
-                        decoder
-                            .icc_profile()
-                            .ok()
-                            .flatten()
-                            .filter(|icc| !icc.is_empty())
-                            .map(Bytes::new)
-                    });
-                    decoder.set_limits(Limits::default())?;
-                    let dynamic = image::DynamicImage::from_decoder(decoder)?;
-                    Ok((dynamic, icc))
-                }
-
-                let cursor = io::Cursor::new(&data);
-                let (mut dynamic, icc) = match format {
-                    ExchangeFormat::Jpg => decode(JpegDecoder::new(cursor), icc),
-                    ExchangeFormat::Gif => decode(GifDecoder::new(cursor), icc),
-                    ExchangeFormat::Webp => decode(WebPDecoder::new(cursor), icc),
-                    ExchangeFormat::Png => {
-                        unreachable!("handled by the branch above")
+                RasterFormat::Exchange(format) => {
+                    fn decode<T: ImageDecoder>(
+                        decoder: ImageResult<T>,
+                        icc: Smart<Bytes>,
+                    ) -> ImageResult<(image::DynamicImage, Option<Bytes>)>
+                    {
+                        let mut decoder = decoder?;
+                        let icc = icc.custom().or_else(|| {
+                            decoder
+                                .icc_profile()
+                                .ok()
+                                .flatten()
+                                .filter(|icc| !icc.is_empty())
+                                .map(Bytes::new)
+                        });
+                        decoder.set_limits(Limits::default())?;
+                        let dynamic = image::DynamicImage::from_decoder(decoder)?;
+                        Ok((dynamic, icc))
                     }
-                }
-                .map_err(format_image_error)?;
 
-                let exif = exif::Reader::new()
-                    .read_from_container(&mut io::Cursor::new(&data))
-                    .ok();
+                    let cursor = io::Cursor::new(&data);
+                    let (mut dynamic, icc) = match format {
+                        ExchangeFormat::Jpg => decode(JpegDecoder::new(cursor), icc),
+                        ExchangeFormat::Gif => decode(GifDecoder::new(cursor), icc),
+                        ExchangeFormat::Webp => decode(WebPDecoder::new(cursor), icc),
+                        ExchangeFormat::Png => {
+                            unreachable!("handled by the branch above")
+                        }
+                    }
+                    .map_err(format_image_error)?;
 
-                // Apply rotation from EXIF metadata.
-                if let Some(rotation) = exif.as_ref().and_then(exif_rotation) {
-                    apply_rotation(&mut dynamic, rotation);
-                    exif_rot = Some(rotation);
-                }
+                    let exif = exif::Reader::new()
+                        .read_from_container(&mut io::Cursor::new(&data))
+                        .ok();
 
-                // Extract pixel density.
-                let dpi = determine_dpi(&data, exif.as_ref());
-                let has_alpha = dynamic.color().has_alpha();
-                let (width, height) = (dynamic.width(), dynamic.height());
+                    // Apply rotation from EXIF metadata.
+                    if let Some(rotation) = exif.as_ref().and_then(exif_rotation) {
+                        apply_rotation(&mut dynamic, rotation);
+                        exif_rot = Some(rotation);
+                    }
 
-                (width, height, has_alpha, icc, dpi, Some(dynamic), None)
-            }
+                    // Extract pixel density.
+                    let dpi = determine_dpi(&data, exif.as_ref());
+                    let has_alpha = dynamic.color().has_alpha();
+                    let (width, height) = (dynamic.width(), dynamic.height());
 
-            RasterFormat::Pixel(format) => {
-                if format.width == 0 || format.height == 0 {
-                    bail!("zero-sized images are not allowed");
-                }
-
-                let channels = match format.encoding {
-                    PixelEncoding::Rgb8 => 3,
-                    PixelEncoding::Rgba8 => 4,
-                    PixelEncoding::Luma8 => 1,
-                    PixelEncoding::Lumaa8 => 2,
-                };
-
-                let Some(expected_size) = format
-                    .width
-                    .checked_mul(format.height)
-                    .and_then(|size| size.checked_mul(channels))
-                else {
-                    bail!("pixel dimensions are too large");
-                };
-
-                if expected_size as usize != data.len() {
-                    bail!("pixel dimensions and pixel data do not match");
+                    (width, height, has_alpha, icc, dpi, Some(dynamic), None)
                 }
 
-                fn to<P: Pixel<Subpixel = u8>>(
-                    data: &Bytes,
-                    format: PixelFormat,
-                ) -> ImageBuffer<P, Vec<u8>> {
-                    ImageBuffer::from_raw(format.width, format.height, data.to_vec())
-                        .unwrap()
+                RasterFormat::Pixel(format) => {
+                    if format.width == 0 || format.height == 0 {
+                        bail!("zero-sized images are not allowed");
+                    }
+
+                    let channels = match format.encoding {
+                        PixelEncoding::Rgb8 => 3,
+                        PixelEncoding::Rgba8 => 4,
+                        PixelEncoding::Luma8 => 1,
+                        PixelEncoding::Lumaa8 => 2,
+                    };
+
+                    let Some(expected_size) = format
+                        .width
+                        .checked_mul(format.height)
+                        .and_then(|size| size.checked_mul(channels))
+                    else {
+                        bail!("pixel dimensions are too large");
+                    };
+
+                    if expected_size as usize != data.len() {
+                        bail!("pixel dimensions and pixel data do not match");
+                    }
+
+                    fn to<P: Pixel<Subpixel = u8>>(
+                        data: &Bytes,
+                        format: PixelFormat,
+                    ) -> ImageBuffer<P, Vec<u8>> {
+                        ImageBuffer::from_raw(format.width, format.height, data.to_vec())
+                            .unwrap()
+                    }
+
+                    let dynamic: DynamicImage = match format.encoding {
+                        PixelEncoding::Rgb8 => to::<image::Rgb<u8>>(&data, format).into(),
+                        PixelEncoding::Rgba8 => {
+                            to::<image::Rgba<u8>>(&data, format).into()
+                        }
+                        PixelEncoding::Luma8 => {
+                            to::<image::Luma<u8>>(&data, format).into()
+                        }
+                        PixelEncoding::Lumaa8 => {
+                            to::<image::LumaA<u8>>(&data, format).into()
+                        }
+                    };
+
+                    let has_alpha = matches!(
+                        format.encoding,
+                        PixelEncoding::Rgba8 | PixelEncoding::Lumaa8
+                    );
+
+                    (
+                        format.width,
+                        format.height,
+                        has_alpha,
+                        icc.custom(),
+                        None,
+                        Some(dynamic),
+                        None,
+                    )
                 }
-
-                let dynamic: DynamicImage = match format.encoding {
-                    PixelEncoding::Rgb8 => to::<image::Rgb<u8>>(&data, format).into(),
-                    PixelEncoding::Rgba8 => to::<image::Rgba<u8>>(&data, format).into(),
-                    PixelEncoding::Luma8 => to::<image::Luma<u8>>(&data, format).into(),
-                    PixelEncoding::Lumaa8 => to::<image::LumaA<u8>>(&data, format).into(),
-                };
-
-                let has_alpha = matches!(
-                    format.encoding,
-                    PixelEncoding::Rgba8 | PixelEncoding::Lumaa8
-                );
-
-                (
-                    format.width,
-                    format.height,
-                    has_alpha,
-                    icc.custom(),
-                    None,
-                    Some(dynamic),
-                    None,
-                )
-            }
-        };
+            };
 
         let dynamic_cell = OnceLock::new();
         if let Some(dynamic) = eager_dynamic {
@@ -406,18 +420,28 @@ impl RasterImage {
             Some(cursor) if cursor.next_row <= y0 => cursor,
             _ => RowCursor::new(&self.0.data)?,
         };
-        let RowCursor { mut reader, mut next_row, width, channels, bytes_per_sample } =
-            cursor;
+        let RowCursor {
+            mut reader,
+            mut next_row,
+            width,
+            channels,
+            bytes_per_sample,
+        } = cursor;
 
         let height = reader.info().height;
         let y1 = y1.min(height);
         if y0 >= y1 {
-            *guard =
-                Some(RowCursor { reader, next_row, width, channels, bytes_per_sample });
+            *guard = Some(RowCursor {
+                reader,
+                next_row,
+                width,
+                channels,
+                bytes_per_sample,
+            });
             return Some(Vec::new());
         }
 
-        let mut out = vec![0u8; width as usize * (y1 - y0) as usize * 4];
+        let mut out = vec![0_u8; width as usize * (y1 - y0) as usize * 4];
         while next_row < y1 {
             let Some(data) = reader.next_row().ok()? else { break };
             if next_row >= y0 {
@@ -458,7 +482,13 @@ impl RasterImage {
             next_row += 1;
         }
 
-        *guard = Some(RowCursor { reader, next_row, width, channels, bytes_per_sample });
+        *guard = Some(RowCursor {
+            reader,
+            next_row,
+            width,
+            channels,
+            bytes_per_sample,
+        });
         Some(out)
     }
 
@@ -619,9 +649,7 @@ impl From<PixelFormat> for Dict {
 /// pixel data is decoded), with the same transformations `image`'s own PNG
 /// decoder uses, so `output_color_type` and row data match what
 /// `image::DynamicImage::from_decoder` would eventually produce.
-fn png_reader(
-    data: Bytes,
-) -> Result<png::Reader<io::Cursor<Bytes>>, png::DecodingError> {
+fn png_reader(data: Bytes) -> Result<png::Reader<io::Cursor<Bytes>>, png::DecodingError> {
     let mut decoder = png::Decoder::new(io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::EXPAND);
     decoder.read_info()
@@ -882,12 +910,10 @@ mod tests {
             _ => unreachable!("test only uses Rgb/Rgba"),
         };
         let mut data = Vec::with_capacity((width * height * channels * 2) as usize);
-        let mut i: u32 = 0;
-        for _ in 0..(width * height * channels) {
+        for i in 0..(width * height * channels) {
             // A varied, deterministic sequence covering low/mid/high values.
-            let v = ((i.wrapping_mul(2654435761)) % 65536) as u16;
+            let v = ((i.wrapping_mul(2654435761)) % 0x0001_0000) as u16;
             data.extend_from_slice(&v.to_be_bytes());
-            i += 1;
         }
 
         let mut out = Vec::new();
@@ -928,8 +954,8 @@ mod tests {
             // A mid-image sub-range too, to exercise the row-cursor's
             // partial-range path, not just the whole-image case.
             let region = image.decode_rgba_row_range(2, 4).unwrap();
-            let expected = &full.as_raw()
-                [(2 * width * 4) as usize..(4 * width * 4) as usize];
+            let expected =
+                &full.as_raw()[(2 * width * 4) as usize..(4 * width * 4) as usize];
             assert_eq!(region, expected, "{color_type:?}: rows 2..4");
         }
 
@@ -952,7 +978,7 @@ mod tests {
         // truncating `200 >> 8 = 0`. Confirms the formula rounds rather
         // than truncates, matching `image`'s own conversion exactly.
         assert_eq!(sample16_to_8(0x00, 0xC8), 1);
-        assert_ne!(sample16_to_8(0x00, 0xC8), (200u16 >> 8) as u8);
+        assert_ne!(sample16_to_8(0x00, 0xC8), (200_u16 >> 8) as u8);
     }
 
     /// Formats/cases the fast path doesn't support must cleanly fall back

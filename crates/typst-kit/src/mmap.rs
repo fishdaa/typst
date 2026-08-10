@@ -85,7 +85,7 @@ mod tests {
     fn test_read_file_large_mmap_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("large");
-        let content = vec![0x42u8; MMAP_THRESHOLD as usize + 1];
+        let content = vec![0x42_u8; MMAP_THRESHOLD as usize + 1];
         fs::write(&path, &content).unwrap();
         assert_eq!(read_file(&path).unwrap().as_slice(), content.as_slice());
     }
