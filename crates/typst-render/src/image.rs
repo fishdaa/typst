@@ -232,25 +232,31 @@ fn try_blit_opaque(
     let src_y_range = (clip_y0 - dst_y0) as u32..(clip_y1 - dst_y0) as u32;
     let src_x_range = (clip_x0 - dst_x0) as u32..(clip_x1 - dst_x0) as u32;
 
-    // Try to decode just the rows this band/canvas actually needs, so a
+    // Stream in just the rows this band/canvas actually needs, so a
     // full-page-sized source image never has to be fully decoded and held
-    // in memory at once (see `RasterImage::decode_rgba_row_range`). Falls
-    // back to the fully decoded image when the source doesn't qualify
-    // (not PNG, interlaced, EXIF-rotated, etc.).
-    if let Some(rows) = raster.decode_rgba_row_range(src_y_range.start, src_y_range.end) {
-        let pixels = canvas.pixels_mut();
-        for sy in src_y_range.clone() {
+    // in memory at once, and no whole-band copy of it exists either (see
+    // `RasterImage::for_each_rgba_row`). Falls back to the fully decoded
+    // image when the source doesn't qualify (not PNG, interlaced,
+    // EXIF-rotated, etc.).
+    //
+    // Each row is copied in one `copy_from_slice`: an opaque source's rows
+    // arrive as `[r, g, b, 255]`, which is byte-for-byte what tiny-skia
+    // stores for that pixel (`PremultipliedColorU8` is `[r, g, b, a]`, and
+    // premultiplying by an alpha of 1 is the identity), so no per-pixel
+    // conversion is needed.
+    let byte_count = src_x_range.len() * 4;
+    let src_byte_offset = src_x_range.start as usize * 4;
+    let dst_x = (dst_x0 + src_x_range.start as i64) as usize;
+    let data = canvas.data_mut();
+    let streamed =
+        raster.for_each_rgba_row(src_y_range.start, src_y_range.end, |sy, row| {
             let py = (dst_y0 + sy as i64) as usize;
-            let row_off = (sy - src_y_range.start) as usize * src_w as usize * 4;
-            for sx in src_x_range.clone() {
-                let px = (dst_x0 + sx as i64) as usize;
-                let idx = row_off + sx as usize * 4;
-                let (r, g, b) = (rows[idx], rows[idx + 1], rows[idx + 2]);
-                pixels[py * canvas_w + px] =
-                    sk::ColorU8::from_rgba(r, g, b, 255).premultiply();
-            }
-        }
-    } else {
+            let start = (py * canvas_w + dst_x) * 4;
+            data[start..start + byte_count]
+                .copy_from_slice(&row[src_byte_offset..src_byte_offset + byte_count]);
+        });
+
+    if streamed.is_none() {
         let dynamic = raster.dynamic();
         let pixels = canvas.pixels_mut();
         for sy in src_y_range {
@@ -498,17 +504,26 @@ fn try_blit_resized_axis_aligned(
 
     // Try to decode only the source rows this crop actually needs, so a
     // full-page-sized source image never has to be fully decoded and held
-    // in memory at once (see `RasterImage::decode_rgba_row_range`). Falls
+    // in memory at once (see `RasterImage::decode_row_range`). Falls
     // back to the fully decoded, fully converted buffer when the source
     // doesn't qualify (not PNG, interlaced, EXIF-rotated, etc.).
+    //
+    // A source without an alpha channel is decoded and resized as three
+    // channels rather than four, which is a quarter less memory in both the
+    // decoded region and the resize target -- the two largest buffers this
+    // path holds, and both proportional to the band size.
+    let channels: u8 =
+        if !raster.has_alpha() && raster.supports_row_range(3) { 3 } else { 4 };
+    let pixel_type = if channels == 3 { PixelType::U8x3 } else { PixelType::U8x4 };
+
     let row_lo = crop_top.floor().max(0.0) as u32;
     let row_hi = (crop_top + crop_height).ceil().min(src_h as f64) as u32;
-    let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
+    let mut resized = FirImage::new(crop_w, crop_h, pixel_type);
     let opts = ResizeOptions::new().resize_alg(alg);
-    if let Some(region) = raster.decode_rgba_row_range(row_lo, row_hi) {
+    if let Some(region) = raster.decode_row_range(row_lo, row_hi, channels) {
         let region_h = row_hi - row_lo;
         let region_img =
-            FirImage::from_vec_u8(src_w, region_h, region, PixelType::U8x4).ok()?;
+            FirImage::from_vec_u8(src_w, region_h, region, pixel_type).ok()?;
         // `row_hi`/the region's actual height are clamped to `src_h`, but
         // `crop_height` (and, symmetrically, `crop_width` against `src_w`)
         // are derived from the destination-side margin before that clamp,
@@ -522,16 +537,45 @@ fn try_blit_resized_axis_aligned(
         let opts = opts.crop(crop_left, local_crop_top, crop_width, crop_height);
         Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
     } else {
+        // `supports_row_range` already reported that the row-range path
+        // applies whenever `channels` is 3, so in practice this fallback
+        // only runs with a 4-channel `resized`. If a decode nonetheless
+        // fails part-way through the file, `resize` rejects the pixel-type
+        // mismatch and the `?` below hands the image to the general path,
+        // which is the same fallback as any other unsupported source.
         let src = to_rgba8(image)?;
         let opts = opts.crop(crop_left, crop_top, crop_width, crop_height);
         Resizer::new().resize(src.as_ref(), &mut resized, &opts).ok()?;
     }
 
     let (tile_w, tile_h) = ((clip_x1 - clip_x0) as u32, (clip_y1 - clip_y0) as u32);
-    let mut tile = sk::Pixmap::new(tile_w, tile_h)?;
     let offset_x = (local_x0 as u32) - start_x;
     let offset_y = (local_y0 as u32) - start_y;
     let buf = resized.buffer();
+
+    // With no mask and no alpha, `src over dst` is just `src`, so the
+    // resized pixels can go straight into the canvas -- skipping both a
+    // second band-sized pixmap and the compositing pass over it. This is the
+    // common case for a full-bleed opaque background.
+    if state.mask.is_none() && channels == 3 {
+        let canvas_w = canvas.width() as usize;
+        let data = canvas.data_mut();
+        for row in 0..tile_h {
+            let src_start = (((offset_y + row) * crop_w + offset_x) * 3) as usize;
+            let src_row = &buf[src_start..src_start + (tile_w as usize) * 3];
+            let dest_start =
+                ((clip_y0 as usize + row as usize) * canvas_w + clip_x0 as usize) * 4;
+            let dest_row = &mut data[dest_start..dest_start + (tile_w as usize) * 4];
+            for (chunk, dest) in src_row.chunks_exact(3).zip(dest_row.chunks_exact_mut(4))
+            {
+                dest[..3].copy_from_slice(chunk);
+                dest[3] = 255;
+            }
+        }
+        return Some(());
+    }
+
+    let mut tile = sk::Pixmap::new(tile_w, tile_h)?;
     for row in 0..tile_h {
         let row_start = (((offset_y + row) * crop_w + offset_x) * 4) as usize;
         let row_bytes = &buf[row_start..row_start + (tile_w as usize) * 4];

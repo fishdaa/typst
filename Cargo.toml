@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "docs", "tests", "tests/fuzz", "tests/wrapper"]
+members = ["bench", "crates/*", "docs", "tests", "tests/fuzz", "tests/wrapper"]
 default-members = ["crates/typst-cli"]
 resolver = "2"
 
@@ -50,6 +50,7 @@ codespan-reporting = "0.11"
 codex = "0.3.0"
 color-print = "0.3.6"
 comemo = "0.5.1"
+crc32fast = "1"
 csv = "1"
 ctrlc = "3.4.1"
 dirs = "6"

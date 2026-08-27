@@ -830,8 +830,15 @@ fn encode_bands(
         ((max_band_bytes / row_bytes) as u32).clamp(1, height.max(1))
     };
 
+    // A page whose own fill is opaque can only produce opaque pixels (see
+    // `typst_render::is_opaque`), so its alpha channel is a constant 255:
+    // drop it and write three channels instead of four. That is a quarter
+    // fewer bytes for the encoder to filter and compress, and a quarter
+    // smaller output file, for the price of one in-place pass per band.
+    let opaque = typst_render::is_opaque(page);
+
     let mut encoder = png::Encoder::new(&mut out, width, height);
-    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_color(if opaque { png::ColorType::Rgb } else { png::ColorType::Rgba });
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(compression.into());
     let mut writer = encoder.write_header()?;
@@ -840,15 +847,43 @@ fn encode_bands(
     let mut y = 0;
     while y < height {
         let band_height = band_rows.min(height - y);
-        let band = typst_render::render_band(page, opts, y, band_height);
-        let demultiplied_data = band.take_demultiplied();
-        stream.write_all(&demultiplied_data)?;
+        let mut band = typst_render::render_band(page, opts, y, band_height);
+        if opaque {
+            // Premultiplication is the identity at full alpha, so the band's
+            // own buffer already holds the final color values and can be
+            // compacted in place -- no second buffer, and no un-premultiply
+            // pass.
+            let data = band.data_mut();
+            let len = compact_rgba_to_rgb(data);
+            stream.write_all(&data[..len])?;
+        } else {
+            let demultiplied_data = band.take_demultiplied();
+            stream.write_all(&demultiplied_data)?;
+        }
         y += band_height;
     }
 
     stream.finish()?;
 
     Ok(())
+}
+
+/// Compacts tightly packed RGBA pixel data into tightly packed RGB, in
+/// place, returning the length of the compacted prefix.
+///
+/// Only correct when every pixel is opaque, which is why the caller checks
+/// `typst_render::is_opaque` first: the alpha byte is dropped, not blended.
+/// Each pixel's destination offset is strictly below its source offset, so
+/// copying forwards never overwrites data that is still needed.
+fn compact_rgba_to_rgb(data: &mut [u8]) -> usize {
+    let pixels = data.len() / 4;
+    for index in 0..pixels {
+        let (src, dst) = (index * 4, index * 3);
+        data[dst] = data[src];
+        data[dst + 1] = data[src + 1];
+        data[dst + 2] = data[src + 2];
+    }
+    pixels * 3
 }
 
 /// Creates options for HTML export.
@@ -1019,6 +1054,23 @@ impl From<PdfStandard> for typst_pdf::PdfStandard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compacting must keep each pixel's color bytes in order and drop only
+    /// the alpha byte, in place.
+    #[test]
+    fn test_compact_rgba_to_rgb() {
+        let mut data = vec![
+            1, 2, 3, 255, //
+            4, 5, 6, 255, //
+            7, 8, 9, 255,
+        ];
+        let len = compact_rgba_to_rgb(&mut data);
+        assert_eq!(len, 9);
+        assert_eq!(&data[..len], &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        let mut empty: Vec<u8> = vec![];
+        assert_eq!(compact_rgba_to_rgb(&mut empty), 0);
+    }
 
     /// `band_budget` derives byte budgets purely from the memory cap, not
     /// from any page/asset dimensions, so the same `--max-memory` value

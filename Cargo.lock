@@ -3558,6 +3558,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "typst-bench"
+version = "0.15.1-fork.0"
+dependencies = [
+ "libc",
+ "png",
+ "tempfile",
+]
+
+[[package]]
 name = "typst-bundle"
 version = "0.15.1-fork.0"
 dependencies = [
@@ -3759,6 +3768,7 @@ dependencies = [
  "flate2",
  "fontdb",
  "infer",
+ "libc",
  "memmap2",
  "native-tls",
  "notify",
@@ -3828,6 +3838,7 @@ dependencies = [
  "ciborium",
  "codex",
  "comemo",
+ "crc32fast",
  "csv",
  "ecow",
  "either",

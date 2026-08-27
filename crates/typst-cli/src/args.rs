@@ -377,6 +377,14 @@ pub struct CompileArgs {
     /// (more, smaller bands; more frequent disk syncs) for a smaller memory
     /// footprint. Unset uses a fixed built-in budget tuned for typical
     /// documents.
+    ///
+    /// Source assets are not part of this budget, but they no longer need to
+    /// be: a memory-mapped image is released back to the operating system as
+    /// the decoder consumes it, so a large background PNG does not stay
+    /// resident for the whole export. What remains outside the budget is the
+    /// document model, fonts, and process overhead -- tens of mebibytes for
+    /// a typical page -- so leave headroom between this value and a
+    /// container's real limit.
     #[arg(long = "max-memory", value_name = "MEBIBYTES")]
     pub max_memory: Option<u64>,
 

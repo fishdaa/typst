@@ -44,6 +44,29 @@ fn paint_background(canvas: &mut sk::Pixmap, state: State, page: &Page, size: Si
     }
 }
 
+/// Returns whether every pixel [`render`] and [`render_band`] produce for
+/// `page` is fully opaque.
+///
+/// This is decidable from the page's own fill alone: the background is
+/// painted first and covers the whole canvas, and everything drawn on top of
+/// it composites with `src over dst`, which yields an opaque result whenever
+/// the destination is already opaque -- whatever the source's own alpha is.
+///
+/// A caller that encodes the render output can use this to emit three
+/// channels instead of four (a quarter fewer bytes to compress, and a
+/// quarter smaller file) and to skip un-premultiplying, which is the
+/// identity at full alpha. Conservative: a page with no fill, or one filled
+/// with a gradient or tiling pattern, reports `false` even if it happens to
+/// be opaque.
+pub fn is_opaque(page: &Page) -> bool {
+    match page.fill_or_white() {
+        Some(Paint::Solid(color)) => {
+            paint::to_sk_color_u8(color.to_process()).alpha() == u8::MAX
+        }
+        _ => false,
+    }
+}
+
 /// Returns whether any paint in `page` (background, shape fill/stroke, or
 /// text fill/stroke) is a gradient or tiling pattern.
 ///
