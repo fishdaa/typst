@@ -57,10 +57,21 @@ size (or your own worst case) is what to use for real numbers.
 | `svg` | SVG background | 72 | direct SVG rendering vs. a full-size texture |
 | `poster` | opaque PNG background + text/data on top | 72 | the shape real documents have |
 | `poster-scaled` | same as `poster` | 71 | the resampling path (see below) |
+| `poster-rt1` | same as `poster`, `--render-threads 1` | 72 | the sequential render-then-encode loop, as a reference point |
+| `poster-rt8` | same as `poster`, `--render-threads 8` | 72 | whether fan-out past the default of 4 still pays |
+| `poster-scaled-rt1` | same as `poster-scaled`, `--render-threads 1` | 71 | as `poster-rt1`, on the resampling path |
+| `poster-scaled-rt8` | same as `poster-scaled`, `--render-threads 8` | 71 | as `poster-rt8`, on the resampling path |
 | `constrained` | same as `poster`, `--max-memory 512` | 71 | how far the memory cap actually binds |
 | `balanced` | same as `opaque`, `--png-compression balanced` | 72 | encode effort matched to the baseline's default |
 
-Two details matter more than they look:
+The `-rt1`/`-rt8` rows exist because `--render-threads` defaults to a value
+derived from the core count, so the plain rows measure the default rather than
+any fixed width. `-rt1` disables both the row tiling and the render/encode
+pipeline, which makes it the honest before-picture for those two changes, and
+`-rt8` shows whether more threads than the default help. They are fork-only
+flags, so these rows are skipped for the baseline binary.
+
+Three details matter more than they look:
 
 **Native vs. resampled.** A page `N` points wide at 72 ppi is exactly `N`
 device pixels, so a full-bleed asset of the same pixel size lands at its
@@ -71,10 +82,20 @@ A benchmark that only ever renders at native resolution will not see that
 path at all.
 
 **Photographic fixture content.** `write_png` fills the asset with a smooth
-gradient plus deterministic per-pixel noise, so it compresses roughly like a
-photograph. A flat-color fixture compresses several hundred-fold, which makes
-both inflating the source and deflating the output nearly free — precisely
-the work this benchmark exists to measure.
+gradient plus deterministic block-coherent noise, so it compresses roughly
+like a photograph (about three-fold; the harness prints the ratio it achieved
+for each fixture it writes). Both extremes mislead: a flat-color fixture
+compresses several hundred-fold, which makes inflating the source and
+deflating the output nearly free, while independent per-pixel noise is
+essentially incompressible, which turns the same measurement into pure memory
+bandwidth. Either one hides the work this benchmark exists to measure, so
+check the printed ratio if you substitute your own asset.
+
+**Thread count is part of the measurement.** Pass `-j 1` (the harness does) to
+keep page-level parallelism out of it, so that what is being measured is the
+per-page pipeline rather than several pages overlapping. Note that the two are
+separate: `--jobs` controls how many pages export at once, `--render-threads`
+how many threads work on one page.
 
 The last row deserves the same caution: the fork's default
 `--png-compression` is `fast`, which is itself cheaper than the `png` crate's

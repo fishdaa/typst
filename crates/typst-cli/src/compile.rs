@@ -1,11 +1,13 @@
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::mpsc;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use ecow::eco_format;
 use parking_lot::RwLock;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use tiny_skia as sk;
 use typst::diag::{
     At, HintedStrResult, HintedString, SourceDiagnostic, SourceResult, StrResult, Warned,
     bail,
@@ -86,6 +88,9 @@ pub struct CompileConfig {
     /// Caps peak memory used while rendering a page to PNG, in mebibytes.
     /// `None` uses a fixed built-in budget. See `CompileArgs::max_memory`.
     pub max_memory: Option<u64>,
+    /// How many threads render one page's PNG bands. `None` picks a default
+    /// from the core count. See `CompileArgs::render_threads`.
+    pub render_threads: Option<usize>,
     /// The export cache for images, used for caching output files in `typst
     /// watch` sessions with images.
     pub export_cache: ExportCache,
@@ -248,6 +253,7 @@ impl CompileConfig {
             ppi: args.ppi,
             png_compression: args.png_compression,
             max_memory: args.max_memory,
+            render_threads: args.render_threads,
             diagnostic_format: args.process.diagnostic_format,
             open: args.open.clone(),
             export_cache: ExportCache::new(),
@@ -605,6 +611,7 @@ fn export_image_page(
                 &options,
                 config.png_compression,
                 config.max_memory,
+                render_threads(config),
                 concurrency,
                 output,
             )
@@ -648,12 +655,39 @@ fn trim_malloc_best_effort() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn trim_malloc_best_effort() {}
 
+/// How many threads render one page's bands: the user's `--render-threads`,
+/// or a default derived from the core count.
+///
+/// The default is capped well below the core count because PNG compression is
+/// the other half of the pipeline and cannot be parallelized at the default
+/// compression level (`fdeflate` emits one deflate stream with no
+/// resynchronization point), so past a handful of render threads the encoder
+/// is the limit and further tiles only add redundant frame walks.
+fn render_threads(config: &CompileConfig) -> usize {
+    const DEFAULT_MAX: usize = 4;
+    config
+        .render_threads
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(DEFAULT_MAX)
+        })
+        .max(1)
+}
+
 /// The default per-band byte budget and page-cache eviction interval, used
 /// when `--max-memory` isn't given. Tuned for typical documents: e.g. at a
 /// poster's width (~7200px) `DEFAULT_MAX_BAND_BYTES` yields bands of roughly
 /// 500 rows.
 const DEFAULT_MAX_BAND_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_EVICT_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+
+/// A test shim for [`band_budget`] at the default single-threaded pipeline,
+/// so the cap-scaling tests read the same as before the pipeline existed.
+#[cfg(test)]
+fn band_budget_test(max_memory_mib: Option<u64>, concurrency: usize) -> (usize, u64) {
+    band_budget(max_memory_mib, concurrency, 1)
+}
 
 /// A rough allowance for peak memory `--max-memory` doesn't control: the
 /// in-memory document model, font/glyph caches, and other per-process
@@ -682,13 +716,31 @@ const BASE_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
 /// alive at once, so the remaining per-worker budget is divided across
 /// roughly that many same-order buffers, plus headroom for the eviction
 /// interval.
-fn band_budget(max_memory_mib: Option<u64>, concurrency: usize) -> (usize, u64) {
+///
+/// Two of those same-order buffers exist because rendering and encoding are
+/// pipelined (see [`encode_bands`]): one band is being compressed while the
+/// next is being rendered. A third accounts for the per-tile decode buffers of
+/// a tiled band, which partition the band and so sum to roughly one more
+/// band's worth of source rows.
+fn band_budget(
+    max_memory_mib: Option<u64>,
+    concurrency: usize,
+    render_threads: usize,
+) -> (usize, u64) {
     let Some(mib) = max_memory_mib else {
-        return (DEFAULT_MAX_BAND_BYTES, DEFAULT_EVICT_CHUNK_BYTES);
+        // With no cap to divide up, the default band size is instead divided
+        // by how many band-sized buffers the chosen pipeline keeps alive, so
+        // that turning render threads on doesn't quietly raise peak memory:
+        // rendering one band while another is being compressed accounts for
+        // two, and a tiled band additionally holds a band's worth of source
+        // rows so its tiles can read them in any order (see
+        // `RasterImage::reserve_retained_rows`).
+        let in_flight = if render_threads > 1 { 3 } else { 1 };
+        return (DEFAULT_MAX_BAND_BYTES / in_flight, DEFAULT_EVICT_CHUNK_BYTES);
     };
     let budget = mib.saturating_mul(1024 * 1024).saturating_sub(BASE_OVERHEAD_BYTES);
     let per_worker = budget / (concurrency.max(1) as u64);
-    let band_bytes = ((per_worker / 6) as usize).max(4096);
+    let band_bytes = ((per_worker / 8) as usize).max(4096);
     let evict_bytes = (per_worker / 4).clamp(1024 * 1024, 128 * 1024 * 1024);
     (band_bytes, evict_bytes)
 }
@@ -788,10 +840,12 @@ fn render_and_encode_png_in_bands(
     opts: &RenderOptions,
     compression: PngCompression,
     max_memory_mib: Option<u64>,
+    render_threads: usize,
     concurrency: usize,
     output: &Output,
 ) -> Result<(), png::EncodingError> {
-    let (band_bytes, evict_bytes) = band_budget(max_memory_mib, concurrency);
+    let (band_bytes, evict_bytes) =
+        band_budget(max_memory_mib, concurrency, render_threads);
 
     // A plain file gets the page-cache-evicting writer (see
     // `EvictingFileWriter`); stdout may be a pipe or terminal rather than a
@@ -802,21 +856,39 @@ fn render_and_encode_png_in_bands(
             opts,
             compression,
             band_bytes,
+            render_threads,
             EvictingFileWriter::create(path, evict_bytes)?,
         ),
-        Output::Stdout => {
-            encode_bands(page, opts, compression, band_bytes, output.open()?)
-        }
+        Output::Stdout => encode_bands(
+            page,
+            opts,
+            compression,
+            band_bytes,
+            render_threads,
+            output.open()?,
+        ),
     }
 }
 
 /// Does the actual banded render + PNG encode into `out`, shared between
 /// [`render_and_encode_png_in_bands`]'s file and stdout cases.
+///
+/// With `render_threads > 1` the two halves of the work run concurrently: a
+/// spawned thread renders band `k + 1` (itself split into `render_threads` row
+/// tiles, see `typst_render::render_band_into`) while this thread filters and
+/// compresses band `k`. The band channel has capacity one, so the renderer can
+/// only run one band ahead and at most two bands are ever alive -- which is
+/// what `band_budget` accounts for.
+///
+/// PNG compression is inherently serial here (`fdeflate` produces a single
+/// deflate stream with no resynchronization point), so it stays entirely on
+/// this thread and forms the floor on how fast a page can be written.
 fn encode_bands(
     page: &Page,
     opts: &RenderOptions,
     compression: PngCompression,
     max_band_bytes: usize,
+    render_threads: usize,
     mut out: impl Write,
 ) -> Result<(), png::EncodingError> {
     let (width, height) = typst_render::pixel_dimensions(page, opts);
@@ -844,10 +916,9 @@ fn encode_bands(
     let mut writer = encoder.write_header()?;
     let mut stream = writer.stream_writer()?;
 
-    let mut y = 0;
-    while y < height {
-        let band_height = band_rows.min(height - y);
-        let mut band = typst_render::render_band(page, opts, y, band_height);
+    // Writes one rendered band's pixels into the PNG stream. Both branches
+    // work in the band's own buffer, so no copy of it is made.
+    let write_band = |band: &mut sk::Pixmap, stream: &mut dyn Write| -> io::Result<()> {
         if opaque {
             // Premultiplication is the identity at full alpha, so the band's
             // own buffer already holds the final color values and can be
@@ -855,17 +926,108 @@ fn encode_bands(
             // pass.
             let data = band.data_mut();
             let len = compact_rgba_to_rgb(data);
-            stream.write_all(&data[..len])?;
+            stream.write_all(&data[..len])
         } else {
-            let demultiplied_data = band.take_demultiplied();
-            stream.write_all(&demultiplied_data)?;
+            demultiply_in_place(band.data_mut());
+            stream.write_all(band.data())
         }
-        y += band_height;
+    };
+
+    let tiles = render_threads.max(1);
+    if tiles == 1 {
+        // Strictly alternating render and encode, in this thread only.
+        let mut y = 0;
+        while y < height {
+            let band_height = band_rows.min(height - y);
+            let mut band = typst_render::render_band(page, opts, y, band_height);
+            write_band(&mut band, &mut stream)?;
+            y += band_height;
+        }
+    } else {
+        std::thread::scope(|scope| -> Result<(), png::EncodingError> {
+            // Capacity one: the renderer may be a single band ahead, never
+            // more, so exactly two bands can be alive at once.
+            let (band_tx, band_rx) = mpsc::sync_channel::<sk::Pixmap>(1);
+
+            scope.spawn(move || {
+                let mut y = 0;
+                while y < height {
+                    let band_height = band_rows.min(height - y);
+                    let Some(mut band) = sk::Pixmap::new(width, band_height) else {
+                        return;
+                    };
+                    typst_render::render_band_into(
+                        &mut band.as_mut(),
+                        page,
+                        opts,
+                        y,
+                        tiles,
+                    );
+                    if band_tx.send(band).is_err() {
+                        // The encoder failed and dropped the receiver.
+                        return;
+                    }
+                    y += band_height;
+                }
+            });
+
+            // Dropping `band_rx` on the way out of this loop makes the
+            // renderer's next `send` fail, so it winds down on its own and the
+            // scope's implicit join doesn't block.
+            let mut written = 0;
+            for mut band in band_rx {
+                written += band.height();
+                write_band(&mut band, &mut stream)?;
+            }
+
+            // The renderer stops sending if it panics or cannot allocate a
+            // band, which would otherwise leave `stream.finish()` closing a
+            // PNG that is missing rows -- a file that looks structurally
+            // valid but is silently truncated. Fail loudly instead.
+            if written != height {
+                return Err(png::EncodingError::IoError(io::Error::other(format!(
+                    "rendering stopped after {written} of {height} rows"
+                ))));
+            }
+
+            Ok(())
+        })?;
     }
 
     stream.finish()?;
 
     Ok(())
+}
+
+/// Un-premultiplies tightly packed premultiplied RGBA pixel data in place.
+///
+/// This is `tiny_skia::Pixmap::take_demultiplied` without the `self`-consuming
+/// signature, which would prevent the caller from keeping the band's buffer.
+/// The arithmetic is deliberately identical to
+/// `PremultipliedColorU8::demultiply`, down to doing the division in `f64` on
+/// the alpha expressed as a fraction, so the bytes written are the same ones
+/// `take_demultiplied` would have produced.
+fn demultiply_in_place(data: &mut [u8]) {
+    for pixel in data.chunks_exact_mut(4) {
+        let alpha = pixel[3];
+        if alpha == u8::MAX {
+            // Premultiplying by an alpha of 1 was the identity, so undoing it
+            // is too -- and this is the whole buffer for an opaque page.
+            continue;
+        }
+        if alpha == 0 {
+            // A fully transparent pixel has no color to recover; tiny-skia
+            // divides by zero here and lets the `as u8` cast saturate to 0.
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+            continue;
+        }
+        let a = alpha as f64 / 255.0;
+        for channel in &mut pixel[..3] {
+            *channel = (*channel as f64 / a + 0.5) as u8;
+        }
+    }
 }
 
 /// Compacts tightly packed RGBA pixel data into tightly packed RGB, in
@@ -1072,6 +1234,54 @@ mod tests {
         assert_eq!(compact_rgba_to_rgb(&mut empty), 0);
     }
 
+    /// `demultiply_in_place` exists only so the band's buffer survives the
+    /// call; it must produce exactly what `Pixmap::take_demultiplied` would.
+    /// Checked across every alpha value, at colour channels spanning the
+    /// rounding boundaries, since the two differ only in how they round.
+    #[test]
+    fn test_demultiply_in_place_matches_tiny_skia() {
+        let mut pixels = Vec::new();
+        for alpha in 0..=u8::MAX {
+            for channel in [0, 1, 2, 63, 64, 127, 128, 191, 254, 255] {
+                // A premultiplied pixel can never have a channel above its
+                // alpha, and `take_demultiplied` is only defined for valid
+                // premultiplied input.
+                let value = channel.min(alpha);
+                pixels.extend_from_slice(&[value, value / 2, alpha / 3, alpha]);
+            }
+        }
+
+        let width = pixels.len() as u32 / 4;
+        let mut pixmap = sk::Pixmap::new(width, 1).unwrap();
+        pixmap.data_mut().copy_from_slice(&pixels);
+        let expected = pixmap.take_demultiplied();
+
+        let mut actual = pixels;
+        demultiply_in_place(&mut actual);
+        assert_eq!(actual, expected);
+    }
+
+    /// Turning render threads on adds band-sized buffers (one for the
+    /// pipelined band being compressed, one for the retained source rows a
+    /// tiled band shares), so with no explicit cap the default band shrinks
+    /// to keep peak memory where it was.
+    #[test]
+    fn test_band_budget_accounts_for_pipeline_buffers() {
+        let (serial, _) = band_budget(None, 1, 1);
+        let (pipelined, _) = band_budget(None, 1, 4);
+        assert_eq!(serial, DEFAULT_MAX_BAND_BYTES);
+        assert_eq!(pipelined, DEFAULT_MAX_BAND_BYTES / 3);
+        assert_eq!(
+            band_budget(None, 1, 2),
+            band_budget(None, 1, 16),
+            "band size depends on whether the pipeline runs, not its width"
+        );
+
+        // An explicit cap already divides itself across those buffers, so it
+        // is not scaled a second time.
+        assert_eq!(band_budget(Some(512), 1, 1), band_budget(Some(512), 1, 8));
+    }
+
     /// `band_budget` derives byte budgets purely from the memory cap, not
     /// from any page/asset dimensions, so the same `--max-memory` value
     /// scales down banding for a huge poster exactly like it would for a
@@ -1079,19 +1289,19 @@ mod tests {
     /// whatever `row_bytes` (i.e. page width) turns out to be.
     #[test]
     fn test_band_budget_scales_with_cap_not_content() {
-        let (default_band, default_evict) = band_budget(None, 1);
+        let (default_band, default_evict) = band_budget_test(None, 1);
         assert_eq!(default_band, DEFAULT_MAX_BAND_BYTES);
         assert_eq!(default_evict, DEFAULT_EVICT_CHUNK_BYTES);
 
-        let (small_band, small_evict) = band_budget(Some(128), 1);
-        let (large_band, large_evict) = band_budget(Some(2048), 1);
+        let (small_band, small_evict) = band_budget_test(Some(128), 1);
+        let (large_band, large_evict) = band_budget_test(Some(2048), 1);
         assert!(small_band < large_band, "{small_band} should be < {large_band}");
         assert!(small_evict < large_evict, "{small_evict} should be < {large_evict}");
 
         // A cap at or below the base overhead allowance still yields a
         // usable (if minimal) band -- at least one row -- rather than
         // zero/underflowing.
-        let (floor_band, floor_evict) = band_budget(Some(1), 1);
+        let (floor_band, floor_evict) = band_budget_test(Some(1), 1);
         assert!(floor_band > 0);
         assert!(floor_evict > 0);
     }
@@ -1101,8 +1311,8 @@ mod tests {
     /// proportionally smaller slice of the same overall cap.
     #[test]
     fn test_band_budget_scales_with_concurrency() {
-        let (band_1, evict_1) = band_budget(Some(512), 1);
-        let (band_4, evict_4) = band_budget(Some(512), 4);
+        let (band_1, evict_1) = band_budget_test(Some(512), 1);
+        let (band_4, evict_4) = band_budget_test(Some(512), 4);
         assert!(band_4 < band_1, "{band_4} should be < {band_1}");
         assert!(evict_4 < evict_1, "{evict_4} should be < {evict_1}");
         // Roughly a 4x reduction (integer division, so allow some slack).
@@ -1110,9 +1320,9 @@ mod tests {
 
         // `concurrency == 0` is treated the same as `1` (never divide by
         // zero / hand out an unbounded budget).
-        assert_eq!(band_budget(Some(512), 0), band_budget(Some(512), 1));
+        assert_eq!(band_budget_test(Some(512), 0), band_budget_test(Some(512), 1));
 
         // `None` (no cap requested) is unaffected by concurrency.
-        assert_eq!(band_budget(None, 4), band_budget(None, 1));
+        assert_eq!(band_budget_test(None, 4), band_budget_test(None, 1));
     }
 }

@@ -8,7 +8,11 @@ use typst_library::visualize::{
 use crate::{AbsExt, State, paint};
 
 /// Render a geometrical shape into the canvas.
-pub fn render_shape(canvas: &mut sk::Pixmap, state: State, shape: &Shape) -> Option<()> {
+pub fn render_shape(
+    canvas: &mut sk::PixmapMut,
+    state: State,
+    shape: &Shape,
+) -> Option<()> {
     let ts = state.transform;
     let path = match &shape.geometry {
         Geometry::Line(target) => {

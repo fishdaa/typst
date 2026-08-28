@@ -41,8 +41,9 @@ decoded source, a render texture, the page canvas, and the encoded output.
 That is enough to make an otherwise valid document exceed a small worker's
 RAM limit.
 
-The fork therefore concentrates on reducing peak memory rather than changing
-Typst's language or document output. Small assets keep the established
+The fork therefore concentrates on reducing peak memory, and on the wall-clock
+cost of the paths it introduces, rather than changing Typst's language or
+document output. Small assets keep the established
 paths, where they are already fast; large assets get bounded-memory paths
 instead — see the scenario table below for exactly which path applies where
 and why. The full change set is in the commit history (`git log
@@ -57,7 +58,18 @@ typst compile --max-memory 512 --ppi 72 poster.typ poster.png
 
 # Choose a faster PNG compression effort for large exports.
 typst compile --png-compression fastest poster.typ poster.png
+
+# Choose how many threads render one page (default: cores, capped at 4).
+typst compile --render-threads 4 poster.typ poster.png
 ```
+
+`--render-threads` splits each horizontal band into that many row tiles,
+rendered in parallel into disjoint rows of the band's own buffer, while a
+further thread compresses the previous band — so rendering and PNG encoding
+overlap instead of alternating. It is bounded by the encoder, which has to stay
+sequential, so the default stops at four threads; `--render-threads 1` restores
+the strictly sequential loop. Note that this is orthogonal to `--jobs`, which
+controls how many *pages* are exported at once.
 
 `--max-memory` is a PNG-export budget for the render/encode portion of a
 compile, not a hard cgroup guarantee: document layout, fonts, and process
@@ -82,11 +94,15 @@ these across machines.
 
 | Scenario | Time (stock) | Time (fork) | Peak RSS (stock) | Peak RSS (fork) |
 | --- | ---: | ---: | ---: | ---: |
-| Opaque PNG background | 11.37 s | **2.09 s** | 2127 MiB | **44 MiB** |
-| Alpha PNG background | 11.65 s | **2.68 s** | 2275 MiB | **45 MiB** |
-| SVG background | 1.94 s | **0.28 s** | 1510 MiB | **41 MiB** |
-| Poster (background + text/data) | 11.50 s | **2.18 s** | 2149 MiB | **54 MiB** |
-| Poster, background resampled | 25.20 s | **3.05 s** | 3310 MiB | **93 MiB** |
+| Opaque PNG background | 11.37 s | **1.51 s** | 2127 MiB | **45 MiB** |
+| Alpha PNG background | 11.65 s | **1.60 s** | 2275 MiB | **47 MiB** |
+| SVG background | 1.94 s | **0.23 s** | 1510 MiB | **42 MiB** |
+| Poster (background + text/data) | 11.50 s | **1.54 s** | 2149 MiB | **56 MiB** |
+| Poster, background resampled | 25.20 s | **1.73 s** | 3310 MiB | **77 MiB** |
+
+The fork column was re-measured for the most recent round; the stock column is
+carried over from the run that produced it, since building upstream again does
+not change it. Both were measured on this host with the same harness.
 
 Peak memory is the point of the exercise: the fork exports a 130-megapixel
 poster in tens of mebibytes rather than gigabytes, and — importantly for a
@@ -111,54 +127,85 @@ that default is deliberately `--png-compression fast`:
 `balanced` is the effort upstream uses, so the second row is the honest
 like-for-like comparison: at matched effort the fork produces a 9% *smaller*
 file (it writes three channels instead of four for an opaque page) in
-9.67 s versus 11.37 s, still using 44 MiB against 2127 MiB. The
+8.97 s versus 11.37 s, still using 45 MiB against 2127 MiB. The
 `fast` default trades file size for speed on purpose; `--png-compression`
 exists to choose otherwise.
 
 Finally, `--max-memory` behaves as a dial rather than a cliff: the same
-resampled poster at `--max-memory 512` takes 3.13 s and peaks at 286 MiB,
-against 3.05 s and 93 MiB with the flag left off (whose built-in budget is
-tighter than 512 MiB for this page).
+resampled poster at `--max-memory 512` takes 1.88 s and peaks at 379 MiB,
+against 1.73 s and 77 MiB with the flag left off (whose built-in budget is
+tighter than 512 MiB for this page). Tightening it keeps working: on a
+3000x9000-point poster the peak lands at 75%, 85% and 63% of a 128, 256 and
+512 MiB cap respectively — the flag spends more of a large budget than it used
+to, and stays inside it.
 
 ### What the most recent round changed
 
-The fork's own before/after, same fixtures and host, comparing the previous
-fork commit with this one:
+This round is about CPU rather than memory: the export was using about one
+core regardless of how many the machine had. The fork's own before/after, same
+fixtures and host, comparing the previous fork commit with this one:
 
 | Scenario | Time | Peak RSS | Output |
 | --- | ---: | ---: | ---: |
-| Opaque PNG background | 3.33 s → 2.09 s (−37%) | 169 MiB → 44 MiB (−74%) | 142.9 → 118.4 MiB (−17%) |
-| Alpha PNG background | 3.66 s → 2.68 s (−27%) | 177 MiB → 45 MiB (−75%) | 142.9 → 118.4 MiB (−17%) |
-| SVG background | 0.34 s → 0.28 s (−19%) | 41.5 MiB → 41.2 MiB | 2.5 → 1.9 MiB (−24%) |
-| Poster (background + text/data) | 3.44 s → 2.18 s (−37%) | 180 MiB → 54 MiB (−70%) | 144.9 → 120.3 MiB (−17%) |
-| Poster, background resampled | 11.75 s → 3.05 s (−74%) | 233 MiB → 93 MiB (−60%) | 150.7 → 124.6 MiB (−17%) |
-| Resampled poster, `--max-memory 512` | 6.68 s → 3.13 s (−53%) | 530 MiB → 286 MiB (−46%) | unchanged |
-| Opaque background at `balanced` | 10.80 s → 9.67 s (−11%) | 169 MiB → 44 MiB (−74%) | 68.2 → 62.0 MiB (−9%) |
+| Opaque PNG background | 2.17 s → **1.51 s** (−31%) | 43.6 → 44.8 MiB | unchanged |
+| Alpha PNG background | 2.77 s → **1.60 s** (−42%) | 45.4 → 46.8 MiB | unchanged |
+| SVG background | 0.31 s → **0.23 s** (−26%) | 41.7 → 41.8 MiB | unchanged |
+| Poster (background + text/data) | 2.25 s → **1.54 s** (−32%) | 55.1 → 56.1 MiB | unchanged |
+| Poster, background resampled | 3.15 s → **1.73 s** (−45%) | 93.6 → **77.3 MiB** (−17%) | unchanged |
+| Opaque background at `balanced` | 9.67 s → **8.97 s** (−7%) | 45.1 MiB | unchanged |
 
-Rendered output is unchanged: the reference-image suite passes unmodified,
-and exporting the same document with both binaries yields pixel-identical
-PNGs (the fork's are simply three-channel where the page is opaque).
+`--render-threads` is what moves those numbers, and it saturates early,
+because PNG compression is the other half of the work and cannot be
+parallelized at this compression level:
+
+| `--render-threads` | Poster | Poster, resampled |
+| --- | ---: | ---: |
+| 1 (the previous behavior) | 2.25 s | 3.08 s |
+| 4 (the default) | **1.54 s** | **1.73 s** |
+| 8 | 1.65 s | 1.81 s |
+
+Eight threads are already slower than four: each extra tile re-walks the page
+frame, and past the point where compression becomes the limit that walk is all
+the extra thread contributes. The default therefore stops at four.
 
 The four changes behind those numbers:
 
-- **Released pages behind every sequential pass over an asset.** A
-  memory-mapped file used to stay fully resident once anything had read it
-  end to end — and hashing it for the memoized load does exactly that, before
-  the image is ever decoded. Each pass (hash, validate, decode) now releases
-  what it read, so peak memory no longer includes the asset.
-- **One decoder per image instead of one per band.** The resampling path asks
-  for row ranges that overlap by the resize filter's kernel support, which
-  used to rewind the PNG decoder and restart it from row 0 for every band —
-  quadratic in band count, and worse the tighter `--max-memory` was set. The
-  decoder now keeps a bounded tail of decoded rows to serve those small
-  rewinds.
-- **No redundant decompression pass at load.** Large PNGs are validated
-  structurally (chunk walk plus CRCs) rather than by inflating every row up
-  front, since the render path is about to decompress the same bytes anyway.
-  Smaller images keep the full check, where it costs nothing.
-- **Three channels out for an opaque page.** An opaque page fill makes every
-  output pixel opaque, so the alpha channel is a constant that need not be
-  filtered, compressed, or stored.
+- **A band is rendered by several threads at once.** Each horizontal band is
+  split into row tiles, and because a pixmap's rows are contiguous, each tile
+  is a mutable view over a disjoint slice of the band's own buffer — so tiles
+  render straight into the final pixels with no per-tile buffer and no
+  compositing pass to merge them.
+- **Rendering and encoding overlap.** They used to alternate: render a band,
+  compress it, render the next. A renderer thread now works one band ahead of
+  the encoder, which is worth most where compression is expensive.
+- **Concurrent tiles share one PNG decoder.** Tiles reach an image's row
+  cursor in an arbitrary order, and a PNG can only be decompressed forwards,
+  so the naive result is a decoder restart — and a full re-inflate — per tile.
+  The cursor now retains a window as tall as the band, sized from the band
+  itself, so the rows are decoded exactly once and handed out in whatever
+  order the tiles ask for them.
+- **No alpha round-trip when resampling an opaque image.** Resampling
+  premultiplies by alpha and divides it back out afterwards so transparent
+  pixels don't bleed. At a uniform alpha of 255 both passes are exact
+  identities, so they are skipped — two fewer passes over the region, and the
+  buffers they needed are what account for the resampled poster's memory
+  dropping as well.
+
+Two caveats worth stating plainly:
+
+- Peak memory is up by 1–2 MiB on the native paths, because two bands are now
+  alive at once. With no `--max-memory` given, the default band size is
+  divided by how many band-sized buffers the pipeline keeps alive, which is
+  what keeps that difference to a couple of mebibytes rather than a couple of
+  bands' worth.
+- Rendered output is unchanged for pages drawn at native resolution, and the
+  reference-image suite passes unmodified. Where a background has to be
+  resampled, tiling subdivides the resample, which shifts sub-pixel rounding
+  at tile seams. Measured against an unbanded render of the poster fixture,
+  the previous commit already differed at 3 rows out of 8875 (banding does the
+  same thing at band seams); with tiling it is 1–2 rows. So this is an
+  existing artifact moving, not a new one — but it does mean a resampled page
+  is not byte-identical to the previous commit. `--render-threads 1` is.
 
 ### Which path applies where
 
@@ -175,6 +222,9 @@ kick in for the cases that would otherwise dominate peak memory.
 | Large SVG | Rasterize a full placed texture | Render directly into the destination canvas | Memory follows the destination band |
 | Small SVG | Texture path | Existing texture path | Keeps the fast ordinary case |
 | Large PNG export | Full page canvas and encoded output | Streamed horizontal bands and output | Peak memory independent of page height |
+| Rendering a band | One thread, then encode, then repeat | Band split into row tiles rendered in parallel | Uses the cores a worker is paying for |
+| Encoding a band | Alternates with rendering | Overlapped with rendering the next band | Compression stops being dead time |
+| Resampling an opaque raster | Premultiply, convolve, un-premultiply | Convolve directly | Two fewer passes over the region |
 | Opaque page PNG export | Four channels | Three channels | A quarter less to filter, compress, and store |
 | Large PNG load | Full decode up front to validate | Chunk structure and CRC check | No redundant decompression pass |
 | Large source file | Heap-backed file bytes | Memory-mapped, released as it is read | Peak memory independent of asset size |

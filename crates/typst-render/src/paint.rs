@@ -320,6 +320,6 @@ fn render_tiling_frame_cached(
     // Render the tilings into a new canvas.
     let ts = sk::Transform::from_scale(pixel_per_pt, pixel_per_pt);
     let temp_state = State::new(tilings.size(), ts, pixel_per_pt);
-    crate::render_frame(&mut canvas, temp_state, tilings.frame());
+    crate::render_frame(&mut canvas.as_mut(), temp_state, tilings.frame());
     Arc::new(canvas)
 }

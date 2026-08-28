@@ -129,6 +129,38 @@ const SCENARIOS: &[Scenario] = &[
         extra: &[],
         fork_only: false,
     },
+    // The render-thread sweep: `--render-threads 1` is the strictly
+    // sequential render-then-encode loop this fork used to have, so it is the
+    // reference point for what tiling and the render/encode pipeline buy. The
+    // plain `poster` rows above use the flag's default.
+    Scenario {
+        label: "poster-rt1",
+        fixture: "poster",
+        ppi: "72",
+        extra: &["--render-threads", "1"],
+        fork_only: true,
+    },
+    Scenario {
+        label: "poster-rt8",
+        fixture: "poster",
+        ppi: "72",
+        extra: &["--render-threads", "8"],
+        fork_only: true,
+    },
+    Scenario {
+        label: "poster-scaled-rt1",
+        fixture: "poster",
+        ppi: "71",
+        extra: &["--render-threads", "1"],
+        fork_only: true,
+    },
+    Scenario {
+        label: "poster-scaled-rt8",
+        fixture: "poster",
+        ppi: "71",
+        extra: &["--render-threads", "8"],
+        fork_only: true,
+    },
     Scenario {
         label: "constrained",
         fixture: "poster",

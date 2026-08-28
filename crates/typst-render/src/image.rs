@@ -11,13 +11,13 @@ use tiny_skia as sk;
 use tiny_skia::IntSize;
 use typst_library::foundations::Smart;
 use typst_library::layout::Size;
-use typst_library::visualize::{Image, ImageKind, ImageScaling, PdfImage};
+use typst_library::visualize::{Image, ImageKind, ImageScaling, PdfImage, RasterImage};
 
 use crate::{AbsExt, State};
 
 /// Render a raster or SVG image into the canvas.
 pub fn render_image(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: State,
     image: &Image,
     size: Size,
@@ -93,7 +93,7 @@ pub fn render_image(
 /// one render band, so resvg clips the result to the visible portion and keeps
 /// memory proportional to the output band rather than the full SVG size.
 fn try_render_svg(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -133,7 +133,7 @@ fn try_render_svg(
             Some(mask),
         );
     } else {
-        resvg::render(svg.tree(), transform, &mut canvas.as_mut());
+        resvg::render(svg.tree(), transform, canvas);
     }
 
     Some(())
@@ -155,7 +155,7 @@ fn try_render_svg(
 /// Returns `None` (with no side effects) whenever a precondition doesn't
 /// hold, so callers should fall back to the general path unchanged.
 fn try_blit_opaque(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -232,6 +232,8 @@ fn try_blit_opaque(
     let src_y_range = (clip_y0 - dst_y0) as u32..(clip_y1 - dst_y0) as u32;
     let src_x_range = (clip_x0 - dst_x0) as u32..(clip_x1 - dst_x0) as u32;
 
+    reserve_band_rows(raster, state, src_y_range.len() as u32, src_y_range.len() as u32);
+
     // Stream in just the rows this band/canvas actually needs, so a
     // full-page-sized source image never has to be fully decoded and held
     // in memory at once, and no whole-band copy of it exists either (see
@@ -280,7 +282,7 @@ fn try_blit_opaque(
 /// not need a full-size texture: decode the rows visible in this band and
 /// blend them directly into the destination canvas.
 fn try_blit_native_alpha(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -335,6 +337,9 @@ fn try_blit_native_alpha(
 
     let src_y_range = (clip_y0 - dst_y0) as u32..(clip_y1 - dst_y0) as u32;
     let src_x_range = (clip_x0 - dst_x0) as u32..(clip_x1 - dst_x0) as u32;
+
+    reserve_band_rows(raster, state, src_y_range.len() as u32, src_y_range.len() as u32);
+
     let canvas_w = canvas.width() as usize;
     let pixels = bytemuck::cast_slice_mut::<u8, u32>(canvas.data_mut());
     let mut blend_row = |sy: u32, row: &[u8]| {
@@ -406,7 +411,7 @@ fn alpha_mul(color: u32, scale: u32) -> u32 {
 /// Returns `None` (with no side effects) whenever a precondition doesn't
 /// hold, so callers should fall back to the general path unchanged.
 fn try_blit_resized_axis_aligned(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -518,8 +523,22 @@ fn try_blit_resized_axis_aligned(
 
     let row_lo = crop_top.floor().max(0.0) as u32;
     let row_hi = (crop_top + crop_height).ceil().min(src_h as f64) as u32;
+
+    reserve_band_rows(
+        raster,
+        state,
+        (local_y1 - local_y0) as u32,
+        row_hi.saturating_sub(row_lo),
+    );
+
     let mut resized = FirImage::new(crop_w, crop_h, pixel_type);
-    let opts = ResizeOptions::new().resize_alg(alg);
+    // `fast_image_resize` premultiplies by alpha before convolving and
+    // divides it back out afterwards, so transparent pixels don't bleed their
+    // color into their neighbors. For a source whose alpha is uniformly 255
+    // both passes are exact identities -- multiplying by one, then dividing
+    // by one -- so they can be skipped outright, saving two full passes over
+    // the region for the common case of an opaque photographic background.
+    let opts = ResizeOptions::new().resize_alg(alg).use_alpha(raster.has_alpha());
     if let Some(region) = raster.decode_row_range(row_lo, row_hi, channels) {
         let region_h = row_hi - row_lo;
         let region_img =
@@ -621,7 +640,7 @@ fn try_blit_resized_axis_aligned(
 /// interlaced, EXIF-rotated, or
 /// non-PNG), so callers fall back to the general path unchanged.
 fn try_blit_resized_general(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -744,6 +763,13 @@ fn try_blit_resized_general(
     let row_lo = crop_top.floor().max(0.0) as u32;
     let row_hi = (crop_top + crop_height).ceil().min(src_h as f64) as u32;
 
+    reserve_band_rows(
+        raster,
+        state,
+        (local_y1 - local_y0) as u32,
+        row_hi.saturating_sub(row_lo),
+    );
+
     let region = raster.decode_rgba_row_range(row_lo, row_hi)?;
     let region_h = row_hi - row_lo;
     let region_img =
@@ -757,12 +783,11 @@ fn try_blit_resized_general(
     let crop_width = crop_width.min(src_w as f64 - crop_left);
 
     let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
-    let opts = ResizeOptions::new().resize_alg(alg).crop(
-        crop_left,
-        local_crop_top,
-        crop_width,
-        crop_height,
-    );
+    // See the matching comment in `try_blit_resized_axis_aligned`.
+    let opts = ResizeOptions::new()
+        .resize_alg(alg)
+        .use_alpha(raster.has_alpha())
+        .crop(crop_left, local_crop_top, crop_width, crop_height);
     Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
 
     let mut tile = sk::Pixmap::new(crop_w, crop_h)?;
@@ -809,6 +834,33 @@ fn to_rgba8(image: &Image) -> Option<Arc<image::RgbaImage>> {
     Some(Arc::new(raster.dynamic().to_rgba8()))
 }
 
+/// Reserves a retained-row window on `raster` large enough to cover the whole
+/// band this canvas belongs to, rather than just this canvas's own rows.
+///
+/// The tiles of one band are rendered concurrently
+/// (see `typst_render::render_band_into`), so they reach a raster image's
+/// single sequential row cursor in an arbitrary order: whichever tile arrives
+/// first pulls the cursor down to its own rows, and every tile above it then
+/// asks for rows the cursor has already passed. Without a window that spans
+/// the band, each of those would restart decompression from row 0 and make a
+/// tiled band cost `O(tiles * height)` row decodes instead of `O(height)`.
+///
+/// `dst_rows` and `src_rows` are this request's own destination and source row
+/// counts, so the ratio between them extrapolates the band's height into
+/// source rows without this function needing to know which coordinate space
+/// the caller works in.
+fn reserve_band_rows(raster: &RasterImage, state: &State, dst_rows: u32, src_rows: u32) {
+    if state.band_rows == 0 || dst_rows == 0 {
+        return;
+    }
+    // `src_rows` covers this request's own rows plus the resample filter's
+    // margin on both sides, so the ratio is already an over-estimate of the
+    // band's source rows and needs no further slack added on top.
+    let per_row = src_rows as f64 / dst_rows as f64;
+    let rows = (state.band_rows as f64 * per_row).ceil();
+    raster.reserve_retained_rows(rows.min(u32::MAX as f64) as u32);
+}
+
 /// Prepare a texture for an image at a scaled size.
 #[comemo::memoize]
 fn build_texture(image: &Image, w: u32, h: u32) -> Option<Arc<sk::Pixmap>> {
@@ -847,9 +899,11 @@ fn build_texture(image: &Image, w: u32, h: u32) -> Option<Arc<sk::Pixmap>> {
                 // resize.
                 let src = to_rgba8(image)?;
                 let mut dst = FirImage::new(w, h, PixelType::U8x4);
-                Resizer::new()
-                    .resize(src.as_ref(), &mut dst, &ResizeOptions::new().resize_alg(alg))
-                    .ok()?;
+                // See the matching comment in
+                // `try_blit_resized_axis_aligned` for `use_alpha`.
+                let opts =
+                    ResizeOptions::new().resize_alg(alg).use_alpha(raster.has_alpha());
+                Resizer::new().resize(src.as_ref(), &mut dst, &opts).ok()?;
 
                 let chunks = dst.buffer().chunks_exact(4);
                 for (src, dest) in chunks.zip(texture.pixels_mut()) {

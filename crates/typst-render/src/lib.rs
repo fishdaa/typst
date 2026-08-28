@@ -14,6 +14,7 @@ use typst_library::visualize::{Color, Geometry, Paint};
 use typst_utils::Scalar;
 
 /// The page geometry shared by [`render`] and [`render_band`].
+#[derive(Copy, Clone)]
 struct PageGeometry {
     bleed: Sides<Abs>,
     size: Size,
@@ -33,7 +34,7 @@ fn page_geometry(page: &Page, opts: &RenderOptions) -> PageGeometry {
 
 /// Paints the page's background fill (solid color or gradient/pattern) onto
 /// `canvas`, which may be the full page or a single band of it.
-fn paint_background(canvas: &mut sk::Pixmap, state: State, page: &Page, size: Size) {
+fn paint_background(canvas: &mut sk::PixmapMut, state: State, page: &Page, size: Size) {
     if let Some(fill) = page.fill_or_white() {
         if let Paint::Solid(color) = fill {
             canvas.fill(paint::to_sk_color(color.to_process()));
@@ -129,10 +130,11 @@ pub fn render(page: &Page, opts: &RenderOptions) -> sk::Pixmap {
     let state = State::new(geo.size, ts, geo.pixel_per_pt);
 
     let mut canvas = sk::Pixmap::new(geo.pxw, geo.pxh).unwrap();
-    paint_background(&mut canvas, state, page, geo.size);
+    let mut view = canvas.as_mut();
+    paint_background(&mut view, state, page, geo.size);
 
     let state = state.pre_translate(Point { x: geo.bleed.left, y: geo.bleed.top });
-    render_frame(&mut canvas, state, &page.frame);
+    render_frame(&mut view, state, &page.frame);
 
     canvas
 }
@@ -146,7 +148,6 @@ pub fn render(page: &Page, opts: &RenderOptions) -> sk::Pixmap {
 /// next one. Each call re-walks the whole frame, so this trades some
 /// redundant tree-walking for materializing only `band_height_px` rows of
 /// pixels at a time instead of the whole page.
-#[typst_macros::time(name = "render band")]
 pub fn render_band(
     page: &Page,
     opts: &RenderOptions,
@@ -154,17 +155,113 @@ pub fn render_band(
     band_height_px: u32,
 ) -> sk::Pixmap {
     let geo = page_geometry(page, opts);
+    let mut canvas = sk::Pixmap::new(geo.pxw, band_height_px).unwrap();
+    render_band_into(&mut canvas.as_mut(), page, opts, y_offset_px, 1);
+    canvas
+}
+
+/// Renders a horizontal band of a page into an existing canvas, splitting it
+/// into `tiles` row tiles rendered in parallel.
+///
+/// This is [`render_band`] with the canvas supplied by the caller, and with
+/// the band's rows optionally spread across threads. The band covers device
+/// pixel rows `y_offset_px..y_offset_px + canvas.height()` of the full page.
+///
+/// The canvas must arrive zeroed (as a fresh `Pixmap` does): a page whose fill
+/// is transparent leaves parts of it untouched, so a recycled buffer would
+/// show the previous band's pixels through.
+///
+/// Tiling is free of extra copies: each tile is a `PixmapMut` over a disjoint
+/// row range of `canvas`'s own bytes (rows are contiguous, so a row range is a
+/// contiguous slice), and therefore renders straight into the final buffer.
+/// What tiles do share is the sequential row cursor of any raster image on the
+/// page -- see `State::band_rows`, which tells the decoder to retain enough
+/// rows that tiles can pull from it in any order without restarting it.
+///
+/// Rendering more tiles re-walks the page frame more times (the same trade
+/// `render_band` already makes for bands), so a caller should keep tiles
+/// proportionate to the band's height rather than to the core count alone.
+#[typst_macros::time(name = "render band")]
+pub fn render_band_into(
+    canvas: &mut sk::PixmapMut,
+    page: &Page,
+    opts: &RenderOptions,
+    y_offset_px: u32,
+    tiles: usize,
+) {
+    let geo = page_geometry(page, opts);
+    let band_rows = canvas.height();
+
+    // One tile per `MIN_TILE_ROWS` rows at most: below that the redundant
+    // frame walk costs more than the parallelism returns.
+    const MIN_TILE_ROWS: u32 = 32;
+    let tiles = tiles.clamp(1, (band_rows / MIN_TILE_ROWS).max(1) as usize);
+    if tiles == 1 {
+        // Zero, not `band_rows`: an untiled band walks any image's rows
+        // strictly in order, so it needs no retained window beyond the small
+        // default one, and reserving a band-sized window would cost memory
+        // for nothing.
+        render_tile(canvas, page, &geo, y_offset_px, 0);
+        return;
+    }
+
+    let width = canvas.width();
+    let stride = width as usize * 4;
+    let rows_per_tile = band_rows.div_ceil(tiles as u32);
+
+    // Carve the canvas into disjoint row ranges up front, so each tile owns
+    // its slice for the duration of the scope and no locking is needed to
+    // write pixels.
+    let mut slices = Vec::with_capacity(tiles);
+    let mut rest = canvas.data_mut();
+    let mut y = 0;
+    while y < band_rows {
+        let rows = rows_per_tile.min(band_rows - y);
+        let (head, tail) = rest.split_at_mut(rows as usize * stride);
+        slices.push((y, rows, head));
+        rest = tail;
+        y += rows;
+    }
+
+    // One OS thread per tile, deliberately not `rayon::scope`. The caller may
+    // itself be a blocked rayon worker -- the CLI's encoder waits on a channel
+    // for rendered bands while sitting on the pool -- and with `-j 1` that is
+    // the only worker there is, so handing tiles to the pool would wait for a
+    // thread that is waiting for us. Spawning directly cannot deadlock on the
+    // pool's occupancy, and a few thread spawns per band are immaterial next
+    // to rendering a band's worth of pixels.
+    std::thread::scope(|scope| {
+        for (dy, rows, bytes) in slices {
+            let geo = &geo;
+            scope.spawn(move || {
+                let Some(mut tile) = sk::PixmapMut::from_bytes(bytes, width, rows) else {
+                    return;
+                };
+                render_tile(&mut tile, page, geo, y_offset_px + dy, band_rows);
+            });
+        }
+    });
+}
+
+/// Renders the page into `canvas`, which covers device pixel rows starting at
+/// `y_offset_px`. `band_rows` is the height of the whole band this canvas
+/// belongs to, which may be larger than the canvas when it is one tile of a
+/// tiled band.
+fn render_tile(
+    canvas: &mut sk::PixmapMut,
+    page: &Page,
+    geo: &PageGeometry,
+    y_offset_px: u32,
+    band_rows: u32,
+) {
     let ts = sk::Transform::from_scale(geo.pixel_per_pt, geo.pixel_per_pt)
         .post_translate(0.0, -(y_offset_px as f32));
-    let state = State::new(geo.size, ts, geo.pixel_per_pt);
+    let state = State::new(geo.size, ts, geo.pixel_per_pt).with_band_rows(band_rows);
 
-    let mut canvas = sk::Pixmap::new(geo.pxw, band_height_px).unwrap();
-    paint_background(&mut canvas, state, page, geo.size);
+    paint_background(canvas, state, page, geo.size);
 
     let state = state.pre_translate(Point { x: geo.bleed.left, y: geo.bleed.top });
-    render_frame(&mut canvas, state, &page.frame);
-
-    canvas
+    render_frame(canvas, state, &page.frame);
 }
 
 /// Export a document with potentially multiple pages into a single raster image.
@@ -254,6 +351,19 @@ struct State<'a> {
     pixel_per_pt: f32,
     /// The size of the first hard frame in the hierarchy.
     size: Size,
+    /// The height in device pixels of the band this canvas belongs to, which
+    /// is larger than the canvas itself when the canvas is one tile of a
+    /// tiled band (see [`render_band_into`]), and zero when rendering is not
+    /// banded at all.
+    ///
+    /// Tiles of one band are rendered concurrently, so they reach a raster
+    /// image's single sequential row cursor in an arbitrary order. This tells
+    /// the blit paths how many rows that cursor must retain for the whole
+    /// band, so a tile arriving out of order is served from the retained rows
+    /// instead of restarting the decoder from row 0 -- which would undo the
+    /// point of decoding the image once (see
+    /// `RasterImage::decode_row_range`).
+    band_rows: u32,
 }
 
 impl<'a> State<'a> {
@@ -302,6 +412,12 @@ impl<'a> State<'a> {
         Self { size, ..self }
     }
 
+    /// Sets the height of the band this canvas belongs to. See
+    /// [`State::band_rows`].
+    fn with_band_rows(self, band_rows: u32) -> Self {
+        Self { band_rows, ..self }
+    }
+
     /// Pre concat the container's transform.
     fn pre_concat_container(self, transform: sk::Transform) -> Self {
         Self {
@@ -312,7 +428,7 @@ impl<'a> State<'a> {
 }
 
 /// Render a frame into the canvas.
-fn render_frame(canvas: &mut sk::Pixmap, state: State, frame: &Frame) {
+fn render_frame(canvas: &mut sk::PixmapMut, state: State, frame: &Frame) {
     for (pos, item) in frame.items() {
         match item {
             FrameItem::Group(group) => {
@@ -334,7 +450,7 @@ fn render_frame(canvas: &mut sk::Pixmap, state: State, frame: &Frame) {
 }
 
 /// Render a group frame with optional transform and clipping into the canvas.
-fn render_group(canvas: &mut sk::Pixmap, state: State, pos: Point, group: &GroupItem) {
+fn render_group(canvas: &mut sk::PixmapMut, state: State, pos: Point, group: &GroupItem) {
     let sk_transform = to_sk_transform(&group.transform);
     let state = match group.frame.kind() {
         FrameKind::Soft => state.pre_translate(pos).pre_concat(sk_transform),

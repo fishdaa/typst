@@ -54,6 +54,10 @@ struct RasterImageInner {
     /// a later row -- making a full band-by-band render of an image
     /// `O(bands * height)` instead of `O(height)`.
     row_cursor: Mutex<Option<RowCursor>>,
+    /// A floor, in rows, on how much of the decoded tail `row_cursor` keeps
+    /// behind itself. Raised through [`RasterImage::reserve_retained_rows`]
+    /// by a caller that is about to make row-range requests out of order.
+    retain_rows: AtomicU32,
     /// How many times a decoder has been opened for `row_cursor`. Since a
     /// PNG can only be decompressed from the start, each start past the
     /// first re-does all the work up to the requested row -- so this is the
@@ -159,6 +163,13 @@ impl io::Seek for PagedSource {
 const RETAIN_MAX_ROWS: usize = 128;
 const RETAIN_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// The ceiling on a window requested through
+/// [`RasterImage::reserve_retained_rows`], which asks for more than the
+/// default bounds above. That request is derived from a band's height, which
+/// a caller already sizes to its memory budget, so this only guards against
+/// a nonsensical value.
+const RETAIN_RESERVED_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// A `png` reader paused after decoding up to (but not including)
 /// `next_row`, plus a bounded tail of the rows it already handed out.
 struct RowCursor {
@@ -224,8 +235,16 @@ impl RowCursor {
 
     /// Adds a just-decoded row to the retained tail, returning a buffer that
     /// is free for reuse (the evicted row, or a fresh empty one).
-    fn push_retained(&mut self, row: Vec<u8>) -> Vec<u8> {
-        let max_rows = RETAIN_MAX_ROWS.min((RETAIN_MAX_BYTES / row.len().max(1)).max(1));
+    ///
+    /// `reserved` is a floor on the window size requested through
+    /// [`RasterImage::reserve_retained_rows`]; the default bounds apply when
+    /// it is zero.
+    fn push_retained(&mut self, row: Vec<u8>, reserved: u32) -> Vec<u8> {
+        let row_len = row.len().max(1);
+        let default_rows = RETAIN_MAX_ROWS.min((RETAIN_MAX_BYTES / row_len).max(1));
+        let reserved_rows =
+            (reserved as usize).min((RETAIN_RESERVED_MAX_BYTES / row_len).max(1));
+        let max_rows = default_rows.max(reserved_rows);
         self.retained.push_back(row);
         if self.retained.len() > max_rows {
             self.retained_from += 1;
@@ -244,6 +263,7 @@ impl RowCursor {
         y0: u32,
         y1: u32,
         out_channels: u8,
+        reserved: u32,
         f: &mut dyn FnMut(u32, &[u8]),
     ) -> Option<()> {
         let mut scratch = vec![0_u8; self.width as usize * out_channels as usize];
@@ -291,7 +311,7 @@ impl RowCursor {
                 f(y, &scratch);
             }
             self.next_row += 1;
-            self.spare = self.push_retained(buf);
+            self.spare = self.push_retained(buf, reserved);
         }
 
         Some(())
@@ -532,6 +552,7 @@ impl RasterImage {
             icc,
             dpi,
             row_cursor: Mutex::new(None),
+            retain_rows: AtomicU32::new(0),
             decoder_starts: AtomicU32::new(0),
         })))
     }
@@ -698,6 +719,25 @@ impl RasterImage {
         self.0.decoder_starts.load(atomic::Ordering::Relaxed)
     }
 
+    /// Asks the row cursor to keep at least `rows` already-decoded rows
+    /// behind itself, so that a later request for an earlier row is served
+    /// from memory instead of restarting decompression from row 0.
+    ///
+    /// Row-range requests are cheap only while they arrive in increasing
+    /// order, which holds naturally for a band-by-band render. The row tiles
+    /// of a single band, however, are rendered concurrently and so reach the
+    /// image in an arbitrary order: whichever tile arrives first pulls the
+    /// cursor down to its own rows, and every tile above it then asks for
+    /// rows the cursor has already passed. Reserving a window as tall as the
+    /// band's source rows makes that order irrelevant -- the rows are decoded
+    /// exactly once and handed out in whatever order the tiles ask for them.
+    ///
+    /// The floor only ever rises, and is capped (see
+    /// `RETAIN_RESERVED_MAX_BYTES`).
+    pub fn reserve_retained_rows(&self, rows: u32) {
+        self.0.retain_rows.fetch_max(rows, atomic::Ordering::Relaxed);
+    }
+
     /// Whether [`Self::decode_row_range`] can serve this image with the
     /// given channel count, without decoding any pixels.
     ///
@@ -784,8 +824,12 @@ impl RasterImage {
             return None;
         }
 
-        let result =
-            if y0 < y1 { cursor.visit(y0, y1, out_channels, &mut f) } else { Some(()) };
+        let reserved = self.0.retain_rows.load(atomic::Ordering::Relaxed);
+        let result = if y0 < y1 {
+            cursor.visit(y0, y1, out_channels, reserved, &mut f)
+        } else {
+            Some(())
+        };
         *guard = Some(cursor);
         result
     }
@@ -1357,6 +1401,62 @@ mod tests {
             image.decoder_starts(),
             1,
             "overlapping row ranges must not restart the decoder"
+        );
+    }
+
+    /// The row tiles of one band are rendered concurrently, so they reach
+    /// the row cursor in an arbitrary order. With a window reserved to cover
+    /// the band (see `RasterImage::reserve_retained_rows`) that must still
+    /// cost exactly one decoder start, and each tile must get exactly the
+    /// rows it asked for -- otherwise a tiled band would decode the image
+    /// once per tile instead of once.
+    #[test]
+    fn test_out_of_order_tiles_reuse_one_decoder() {
+        // A size no other test uses: `RasterImage::plain` is memoized on its
+        // bytes, so sharing a fixture would share the decoder-start counter
+        // this test asserts on.
+        let (width, height) = (9_u32, 601_u32);
+        let (band, tile, margin) = (120_u32, 30_u32, 5_u32);
+
+        let image = RasterImage::plain(
+            Bytes::new(encode_png8(width, height)),
+            ExchangeFormat::Png,
+        )
+        .unwrap();
+        image.reserve_retained_rows(band + 2 * margin);
+
+        // `encode_png8` fills the image with `i % 251` in row-major order, so
+        // the expected bytes for a row range are known without decoding
+        // anything -- which keeps this independent of the cursor's state.
+        let stride = (width * 3) as usize;
+        let expected = |y0: u32, y1: u32| -> Vec<u8> {
+            (y0 as usize * stride..y1 as usize * stride)
+                .map(|i| (i % 251) as u8)
+                .collect()
+        };
+
+        for band_y0 in (0..height).step_by(band as usize) {
+            let band_y1 = (band_y0 + band).min(height);
+
+            // Tiles arriving back to front: the worst possible order for a
+            // cursor that can only move forwards.
+            let tiles: Vec<u32> = (band_y0..band_y1).step_by(tile as usize).collect();
+            for &ty in tiles.iter().rev() {
+                let (y0, y1) =
+                    (ty.saturating_sub(margin), (ty + tile + margin).min(height));
+                assert_eq!(
+                    image.decode_row_range(y0, y1, 3).unwrap(),
+                    expected(y0, y1),
+                    "rows {y0}..{y1} are wrong when tiles arrive out of order"
+                );
+            }
+        }
+
+        assert_eq!(
+            image.decoder_starts(),
+            1,
+            "out-of-order tiles inside a reserved window must not restart \
+             the decoder"
         );
     }
 
