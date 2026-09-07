@@ -69,7 +69,7 @@ struct RasterImageInner {
 }
 
 /// A [`std::io::Read`] adapter over [`Bytes`] that releases the pages it has
-/// already consumed (see [`Bytes::drop_behind`]).
+/// already consumed (see [`Bytes::release`]).
 ///
 /// A PNG's pixel data can only be decompressed front-to-back, so a decoder
 /// walks the file exactly once, in order. Without this, decoding a large
@@ -135,7 +135,7 @@ impl io::BufRead for PagedSource {
 
 impl io::Seek for PagedSource {
     /// Seeking backwards is allowed and always correct: a released page is
-    /// transparently faulted back in (see [`Bytes::drop_behind`]), it just
+    /// transparently faulted back in (see [`Bytes::release`]), it just
     /// costs a fault. The decoder only seeks within the header region in
     /// practice.
     fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {

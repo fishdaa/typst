@@ -80,7 +80,7 @@ impl Bytes {
     /// already-consumed prefix back to the operating system (see [`Paged`]).
     ///
     /// The only difference from [`Bytes::new`] is that
-    /// [`Bytes::drop_behind`] becomes effective rather than a no-op.
+    /// [`Bytes::release`] becomes effective rather than a no-op.
     pub fn from_paged<T>(data: T) -> Self
     where
         T: Paged,
@@ -483,7 +483,7 @@ impl Hash for dyn Bytelike {
 /// file-backed pages and re-fault them on demand.
 ///
 /// Implement this (and construct via [`Bytes::from_paged`]) to make
-/// [`Bytes::drop_behind`] effective for a source; every other source keeps
+/// [`Bytes::release`] effective for a source; every other source keeps
 /// the default no-op.
 pub trait Paged: Any + Send + Sync {
     /// A view of the whole byte range.

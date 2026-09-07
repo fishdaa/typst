@@ -359,8 +359,18 @@ impl FsRoot {
 
     /// Loads file data from the given virtual path in this root.
     ///
-    /// Returns owned bytes so later in-place changes to an input cannot
-    /// invalidate the data retained by an ongoing compilation.
+    /// Large files are memory-mapped rather than copied into the heap (see
+    /// the memory-mapped loader), so their pages can be reclaimed by the OS under
+    /// memory pressure instead of being pinned for the whole compilation.
+    /// This trades away one guarantee a plain read has: truncating or
+    /// overwriting such a file in place (same inode) while it's still
+    /// mapped and being read can crash the process, instead of the read
+    /// simply seeing old or new (but still valid) content. This is a narrow
+    /// risk in practice -- it requires in-place mutation of a large file
+    /// racing a concurrent read of that same file -- and editors/build
+    /// tools overwhelmingly save via atomic rename, which isn't affected
+    /// (the old mapping is over an unlinked inode, already dropped by the
+    /// time a new one is read).
     pub fn load(&self, path: &VirtualPath) -> FileResult<Bytes> {
         // Join the path to the root. If it tries to escape, deny access. Note:
         // It can still escape via symlinks.
@@ -467,8 +477,11 @@ mod tests {
         assert_eq!(store.slots.lock().len(), 1);
     }
 
-    /// Exercise file loading end-to-end, including large files and
-    /// directory rejection.
+    /// `FsRoot::load` goes through `crate::mmap::read_file` (see that
+    /// module's own unit tests for the threshold/fallback logic in
+    /// isolation) -- these exercise it end-to-end via real files on disk,
+    /// including the below/above-mmap-threshold boundary and the existing
+    /// directory-rejection behavior.
     mod fs_root {
         use std::fs;
 
