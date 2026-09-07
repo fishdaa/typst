@@ -58,7 +58,7 @@ ecow = { version = "0.2.6", features = ["serde"] }
 either = "1"
 env_proxy = "0.4"
 fastrand = "2.3"
-fast_image_resize = { version = "6.1.0", default-features = false, features = ["std", "image", "rayon"] }
+fast_image_resize = { version = "6.1.0", default-features = false, features = ["std", "image"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 fontdb = { version = "0.23", default-features = false }
 fs_extra = "1.3"

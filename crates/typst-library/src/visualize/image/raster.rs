@@ -1089,115 +1089,12 @@ fn validate_png(
         matches!(color_type, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
     let is_8bit = bit_depth == png::BitDepth::Eight;
 
-    // Confirm the rest of the file is intact. Small images are inflated
-    // outright, exactly like the eager formats in `new_impl`; large ones get
-    // the much cheaper structural check (see
-    // `EAGER_VALIDATION_MAX_DECODED_BYTES`).
-    let channels = match color_type {
-        png::ColorType::Grayscale => 1,
-        png::ColorType::GrayscaleAlpha => 2,
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
-        png::ColorType::Indexed => 4,
-    };
-    let bytes_per_sample = if is_8bit { 1 } else { 2 };
-    let decoded_bytes = (width as u64)
-        .saturating_mul(height as u64)
-        .saturating_mul(channels)
-        .saturating_mul(bytes_per_sample);
-
-    if decoded_bytes <= EAGER_VALIDATION_MAX_DECODED_BYTES {
-        // Stream through (and discard) the rest of the rows to confirm the
-        // whole image decodes without error.
-        while reader.next_row().map_err(png_error_message)?.is_some() {}
-    } else {
-        drop(reader);
-        validate_png_chunks(data)?;
-    }
+    // A valid chunk CRC does not prove that the compressed pixel stream is
+    // valid. Validate every row before exposing an infallible lazy decode.
+    // Discarding rows keeps validation memory bounded even for large images.
+    while reader.next_row().map_err(png_error_message)?.is_some() {}
 
     Ok((width, height, has_alpha, icc, is_8bit))
-}
-
-/// The largest decoded size for which [`validate_png`] proves the pixel data
-/// decodes by actually inflating all of it.
-///
-/// Above this, inflating the whole image up front is a full redundant
-/// decompression pass -- the render path is about to decompress the same
-/// bytes again, row range by row range -- which measurably dominates a large
-/// poster's export time. Such files instead get [`validate_png_chunks`],
-/// which is orders of magnitude cheaper and still catches the corruption
-/// that actually happens to large assets in production: truncated uploads,
-/// partial writes, and bit rot.
-///
-/// The residual risk is a file whose chunks are all intact but whose
-/// compressed stream is nonetheless invalid -- which essentially requires a
-/// deliberately crafted file. That surfaces as a panic from
-/// [`RasterImage::decode_dynamic`] rather than a clean error, the same as
-/// today's already-reachable case of the file changing underneath a
-/// memory-mapped read.
-const EAGER_VALIDATION_MAX_DECODED_BYTES: u64 = 32 * 1024 * 1024;
-
-/// Walks a PNG's chunk structure and verifies every chunk's CRC, without
-/// inflating any pixel data.
-///
-/// This reads the compressed bytes once, sequentially, releasing them as it
-/// goes (see [`Bytes::drop_behind`]) so it doesn't leave a large asset
-/// resident just for having been checked.
-fn validate_png_chunks(data: &Bytes) -> StrResult<()> {
-    /// Both errors mimic `png_error_message`'s formatting so that a
-    /// malformed file reports the same way whichever validation ran.
-    fn truncated() -> EcoString {
-        EcoString::from(
-            "failed to decode image (Format error decoding Png: file is truncated)",
-        )
-    }
-    fn corrupt(kind: &[u8]) -> EcoString {
-        let kind = String::from_utf8_lossy(kind);
-        eco_format!(
-            "failed to decode image (Format error decoding Png:              CRC error in chunk {kind})"
-        )
-    }
-
-    let bytes = data.as_slice();
-    let mut pos = 8; // The signature, already validated by `png_reader`.
-    let mut released = 0;
-    let mut saw_end = false;
-
-    while pos < bytes.len() {
-        let header = bytes.get(pos..pos + 8).ok_or_else(truncated)?;
-        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
-        let kind = &header[4..8];
-
-        // The CRC covers the chunk type and its data, but not the length.
-        let body_end = pos
-            .checked_add(8)
-            .and_then(|start| start.checked_add(length))
-            .ok_or_else(truncated)?;
-        let crc_end = body_end.checked_add(4).ok_or_else(truncated)?;
-        if crc_end > bytes.len() {
-            return Err(truncated());
-        }
-
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&bytes[pos + 4..body_end]);
-        let expected = u32::from_be_bytes(bytes[body_end..crc_end].try_into().unwrap());
-        if hasher.finalize() != expected {
-            return Err(corrupt(kind));
-        }
-
-        saw_end |= kind == b"IEND";
-        pos = crc_end;
-        if pos >= released + RELEASE_CHUNK {
-            data.release(released..pos);
-            released = pos;
-        }
-    }
-
-    if !saw_end {
-        return Err(truncated());
-    }
-
-    Ok(())
 }
 
 /// Try to get the rotation from the EXIF metadata.
@@ -1628,16 +1525,23 @@ mod tests {
         out
     }
 
-    /// An image too large for eager validation is checked structurally
-    /// instead (see `EAGER_VALIDATION_MAX_DECODED_BYTES`): a well-formed
-    /// file must still load, and truncation or corruption must still be
-    /// reported at load time rather than slipping through.
     #[test]
-    fn test_large_png_structural_validation() {
-        // Just past the eager-validation threshold, so `validate_png` takes
-        // the chunk/CRC path.
+    fn test_large_png_with_valid_crc_but_missing_pixels() {
+        let mut data = encode_png8(1, 1);
+        // Claim a large image while retaining a valid one-pixel zlib stream.
+        data[16..20].copy_from_slice(&4096_u32.to_be_bytes());
+        data[20..24].copy_from_slice(&4096_u32.to_be_bytes());
+        let crc = crc32fast::hash(&data[12..29]);
+        data[29..33].copy_from_slice(&crc.to_be_bytes());
+        assert!(RasterImage::plain(Bytes::new(data), ExchangeFormat::Png).is_err());
+    }
+
+    /// Large images must be fully validated before lazy decoding.
+    #[test]
+    fn test_large_png_validation() {
+        // Exceed the former 32 MiB structural-only validation threshold.
         let width = 1024;
-        let height = (EAGER_VALIDATION_MAX_DECODED_BYTES / (width as u64 * 3)) as u32 + 8;
+        let height = ((32 * 1024 * 1024) / (width as u64 * 3)) as u32 + 8;
         let data = encode_png8(width, height);
 
         let image =
@@ -1650,7 +1554,7 @@ mod tests {
         else {
             panic!("truncated file must not load");
         };
-        assert!(err.contains("truncated"), "{err}");
+        assert!(err.contains("failed to decode image"), "{err}");
 
         // A single flipped bit inside the compressed data.
         let mut corrupted = data.clone();
@@ -1660,7 +1564,7 @@ mod tests {
         else {
             panic!("corrupted file must not load");
         };
-        assert!(err.contains("CRC error"), "{err}");
+        assert!(err.contains("failed to decode image"), "{err}");
     }
 
     /// Encodes a small in-memory PNG with varied, non-trivial 16-bit sample

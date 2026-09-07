@@ -893,10 +893,9 @@ fn build_texture(image: &Image, w: u32, h: u32) -> Option<Arc<sk::Pixmap>> {
                 // Resizing (rather than the final premultiply pass below) is
                 // the expensive part for a large placed image (e.g. a
                 // full-bleed poster/certificate background), so this uses
-                // `fast_image_resize`, which is SIMD-accelerated and (via its
-                // `rayon` feature) parallelizes the convolution across
-                // threads, instead of `image`'s single-threaded scalar
-                // resize.
+                // SIMD-accelerated `fast_image_resize`. Its Rayon feature
+                // must remain disabled: during banded export, Rayon workers
+                // can all be waiting for these render threads to finish.
                 let src = raster.rgba8();
                 let mut dst = FirImage::new(w, h, PixelType::U8x4);
                 // See the matching comment in
