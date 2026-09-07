@@ -1672,7 +1672,7 @@ mod tests {
             png::ColorType::Rgba => 4,
             png::ColorType::Grayscale => 1,
             png::ColorType::GrayscaleAlpha => 2,
-            _ => unreachable!("test uses direct samples"),
+            png::ColorType::Indexed => unreachable!("test uses direct samples"),
         };
         let mut data = Vec::with_capacity((width * height * channels * 2) as usize);
         for i in 0..(width * height * channels) {

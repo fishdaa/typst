@@ -594,12 +594,6 @@ fn try_blit_resized_axis_aligned(
         return Some(());
     }
 
-    eprintln!(
-        "DBG dst=({dst_w},{dst_h}) dst0=({dst_x0},{dst_y0}) clip=({clip_x0},{clip_y0},{clip_x1},{clip_y1}) local=({local_x0},{local_y0},{local_x1},{local_y1}) start=({start_x},{start_y}) end=({end_x},{end_y}) crop=({crop_w},{crop_h}) tile=({tile_w},{tile_h}) off=({offset_x},{offset_y}) buf={} canvas=({},{})",
-        buf.len(),
-        canvas.width(),
-        canvas.height()
-    );
     let mut tile = sk::Pixmap::new(tile_w, tile_h)?;
     for row in 0..tile_h {
         let row_start = ((offset_y + row) as usize * crop_w as usize + offset_x as usize)

@@ -389,10 +389,10 @@ mod tests {
                 image::ImageBuffer::from_raw(2, 1, vec![42, 0, 173, 127]).unwrap(),
             ),
             DynamicImage::ImageLuma16(
-                image::ImageBuffer::from_raw(2, 1, vec![200, 32768]).unwrap(),
+                image::ImageBuffer::from_raw(2, 1, vec![200, 0x8000]).unwrap(),
             ),
             DynamicImage::ImageLumaA16(
-                image::ImageBuffer::from_raw(2, 1, vec![200, 0, 32768, 40000]).unwrap(),
+                image::ImageBuffer::from_raw(2, 1, vec![200, 0, 0x8000, 40000]).unwrap(),
             ),
         ] {
             let mut encoded = std::io::Cursor::new(Vec::new());
