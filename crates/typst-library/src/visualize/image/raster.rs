@@ -42,6 +42,8 @@ struct RasterImageInner {
     /// of the image (see [`RasterImage::decode_rgba_row_range`]) never pays
     /// for the full decode.
     dynamic: OnceLock<Arc<DynamicImage>>,
+    /// Shared RGBA8 conversion for renderers that cannot stream source rows.
+    rgba8: OnceLock<Arc<DynamicImage>>,
     exif_rotation: Option<u32>,
     icc: Option<Bytes>,
     dpi: Option<f64>,
@@ -215,8 +217,12 @@ impl RowCursor {
         };
         let (color_type, bit_depth) = reader.output_color_type();
         let (bytes_per_sample, channels) = match (bit_depth, color_type) {
+            (png::BitDepth::Eight, png::ColorType::Grayscale) => (1, 1),
+            (png::BitDepth::Eight, png::ColorType::GrayscaleAlpha) => (1, 2),
             (png::BitDepth::Eight, png::ColorType::Rgb) => (1, 3),
             (png::BitDepth::Eight, png::ColorType::Rgba) => (1, 4),
+            (png::BitDepth::Sixteen, png::ColorType::Grayscale) => (2, 1),
+            (png::BitDepth::Sixteen, png::ColorType::GrayscaleAlpha) => (2, 2),
             (png::BitDepth::Sixteen, png::ColorType::Rgb) => (2, 3),
             (png::BitDepth::Sixteen, png::ColorType::Rgba) => (2, 4),
             _ => return None,
@@ -319,8 +325,8 @@ impl RowCursor {
 }
 
 /// Converts one raw PNG row into `dst`, tightly packed with `out_channels`
-/// 8-bit channels. A 4-channel destination fed from a 3-channel source gets
-/// a fully opaque alpha.
+/// 8-bit channels. Grayscale samples are replicated into RGB; sources
+/// without alpha get a fully opaque alpha in a 4-channel destination.
 fn convert_row(
     src: &[u8],
     dst: &mut [u8],
@@ -329,6 +335,25 @@ fn convert_row(
     out_channels: u8,
 ) {
     match (bytes_per_sample, channels, out_channels) {
+        (1 | 2, 1 | 2, 3 | 4) => {
+            let sample_bytes = bytes_per_sample as usize;
+            for (s, d) in src
+                .chunks_exact(channels as usize * sample_bytes)
+                .zip(dst.chunks_exact_mut(out_channels as usize))
+            {
+                let sample = |offset| {
+                    if sample_bytes == 1 {
+                        s[offset]
+                    } else {
+                        sample16_to_8(s[offset], s[offset + 1])
+                    }
+                };
+                d[..3].fill(sample(0));
+                if out_channels == 4 {
+                    d[3] = if channels == 2 { sample(sample_bytes) } else { 255 };
+                }
+            }
+        }
         // Already exactly the destination layout.
         (1, 4, 4) | (1, 3, 3) => dst.copy_from_slice(&src[..dst.len()]),
         (1, 3, 4) => {
@@ -548,6 +573,7 @@ impl RasterImage {
             has_alpha,
             png_is_8bit,
             dynamic: dynamic_cell,
+            rgba8: OnceLock::new(),
             exif_rotation: exif_rot,
             icc,
             dpi,
@@ -658,6 +684,42 @@ impl RasterImage {
         self.decode_dynamic()
     }
 
+    /// Access the fully decoded image with RGBA8 pixels.
+    ///
+    /// Concurrent render tiles share one conversion. Memoizing the conversion
+    /// alone can still compute it concurrently on a cache miss, temporarily
+    /// allocating a full image per tile. The once cell also shares an existing
+    /// RGBA8 dynamic image without copying its pixels.
+    pub fn rgba8(&self) -> &Arc<DynamicImage> {
+        self.0.rgba8.get_or_init(|| {
+            let dynamic = self.dynamic();
+            if dynamic.as_rgba8().is_some() {
+                dynamic.clone()
+            } else {
+                Arc::new(DynamicImage::ImageRgba8(dynamic.to_rgba8()))
+            }
+        })
+    }
+
+    /// Whether the source uses grayscale samples, without decoding PNG pixels.
+    pub fn is_grayscale(&self) -> bool {
+        if matches!(self.0.format, RasterFormat::Exchange(ExchangeFormat::Png)) {
+            return png_reader(self.0.data.clone()).is_ok_and(|reader| {
+                matches!(
+                    reader.output_color_type().0,
+                    png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha
+                )
+            });
+        }
+        matches!(
+            self.dynamic().color(),
+            image::ColorType::L8
+                | image::ColorType::La8
+                | image::ColorType::L16
+                | image::ColorType::La16
+        )
+    }
+
     /// Access the ICC profile, if any.
     pub fn icc(&self) -> Option<&Bytes> {
         self.0.icc.as_ref()
@@ -668,7 +730,7 @@ impl RasterImage {
     /// materializing the whole decoded image.
     ///
     /// Returns `None` if the image doesn't qualify for this fast path --
-    /// only non-interlaced 8-bit- or 16-bit-per-channel RGB/RGBA PNGs with
+    /// only non-interlaced PNGs with RGB or grayscale samples and
     /// no EXIF-driven rotation do. Callers should fall back to
     /// [`Self::dynamic`] in that case.
     pub fn decode_rgba_row_range(&self, y0: u32, y1: u32) -> Option<Vec<u8>> {
@@ -770,7 +832,7 @@ impl RasterImage {
 
         // Three channels are only available for a source that has no alpha
         // channel of its own.
-        let supported = channels == 4 || cursor.channels == 3;
+        let supported = channels == 4 || matches!(cursor.channels, 1 | 3);
         *guard = Some(cursor);
         supported
     }
@@ -819,7 +881,7 @@ impl RasterImage {
         };
 
         // Dropping a real alpha channel is not this function's call to make.
-        if out_channels == 3 && cursor.channels != 3 {
+        if out_channels == 3 && !matches!(cursor.channels, 1 | 3) {
             *guard = Some(cursor);
             return None;
         }
@@ -1278,6 +1340,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_rgba8_shared_across_concurrent_tiles() {
+        let raster = RasterImage::new(
+            Bytes::new(vec![42; 64 * 64]),
+            RasterFormat::Pixel(PixelFormat {
+                encoding: PixelEncoding::Luma8,
+                width: 64,
+                height: 64,
+            }),
+            Smart::Auto,
+        )
+        .unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        let converted = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        raster.rgba8().clone()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        });
+        for image in &converted {
+            assert!(Arc::ptr_eq(image, &converted[0]));
+            assert_eq!(image.as_rgba8().unwrap().get_pixel(0, 0).0, [42, 42, 42, 255]);
+        }
+
+        let native = RasterImage::new(
+            Bytes::new(vec![42; 64 * 64 * 4]),
+            RasterFormat::Pixel(PixelFormat {
+                encoding: PixelEncoding::Rgba8,
+                width: 64,
+                height: 64,
+            }),
+            Smart::Auto,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(native.rgba8(), native.dynamic()));
+    }
+
+    #[test]
     fn test_image_dpi() {
         #[track_caller]
         fn test(path: &str, format: ExchangeFormat, dpi: f64) {
@@ -1566,7 +1670,9 @@ mod tests {
         let channels = match color_type {
             png::ColorType::Rgb => 3,
             png::ColorType::Rgba => 4,
-            _ => unreachable!("test only uses Rgb/Rgba"),
+            png::ColorType::Grayscale => 1,
+            png::ColorType::GrayscaleAlpha => 2,
+            _ => unreachable!("test uses direct samples"),
         };
         let mut data = Vec::with_capacity((width * height * channels * 2) as usize);
         for i in 0..(width * height * channels) {
@@ -1620,6 +1726,64 @@ mod tests {
 
         test(png::ColorType::Rgb);
         test(png::ColorType::Rgba);
+        test(png::ColorType::Grayscale);
+        test(png::ColorType::GrayscaleAlpha);
+    }
+
+    #[test]
+    fn test_grayscale_row_ranges() {
+        for depth in [
+            png::BitDepth::One,
+            png::BitDepth::Two,
+            png::BitDepth::Four,
+            png::BitDepth::Eight,
+        ] {
+            for alpha in [false, true] {
+                // Low bit depths express transparency with tRNS.
+                let explicit_alpha = alpha && depth == png::BitDepth::Eight;
+                let channels = if explicit_alpha { 2 } else { 1 };
+                let mut encoded = Vec::new();
+                {
+                    let mut encoder = png::Encoder::new(&mut encoded, 8, 5);
+                    encoder.set_depth(depth);
+                    encoder.set_color(if explicit_alpha {
+                        png::ColorType::GrayscaleAlpha
+                    } else {
+                        png::ColorType::Grayscale
+                    });
+                    if alpha && !explicit_alpha {
+                        encoder.set_trns(vec![0, 0]);
+                    }
+                    let mut writer = encoder.write_header().unwrap();
+                    let len = 5 * depth as usize * channels;
+                    let data: Vec<u8> = (0..len).map(|i| (i * 37) as u8).collect();
+                    writer.write_image_data(&data).unwrap();
+                }
+                let image =
+                    RasterImage::plain(Bytes::new(encoded), ExchangeFormat::Png).unwrap();
+                assert!(image.supports_row_range(4));
+                assert_eq!(image.supports_row_range(3), !alpha);
+                // Out-of-order overlapping requests exercise retained raw rows.
+                let ranges = [(2, 5), (1, 4), (0, 5)];
+                let streamed: Vec<_> = ranges
+                    .iter()
+                    .map(|&(y0, y1)| image.decode_rgba_row_range(y0, y1).unwrap())
+                    .collect();
+                assert!(image.0.dynamic.get().is_none());
+                let full = image.dynamic().to_rgba8();
+                for ((y0, y1), rows) in ranges.into_iter().zip(streamed) {
+                    assert_eq!(rows, full.as_raw()[y0 as usize * 32..y1 as usize * 32]);
+                }
+                if alpha {
+                    assert!(image.decode_row_range(0, 5, 3).is_none());
+                } else {
+                    assert_eq!(
+                        image.decode_row_range(0, 5, 3).unwrap(),
+                        image.dynamic().to_rgb8().into_raw()
+                    );
+                }
+            }
+        }
     }
 
     /// Pins the 16-bit-to-8-bit channel rounding formula independent of a
@@ -1649,10 +1813,13 @@ mod tests {
         let jpg = RasterImage::plain(Bytes::new(jpg), ExchangeFormat::Jpg).unwrap();
         assert!(jpg.decode_rgba_row_range(0, 1).is_none());
 
-        // Grayscale PNG (not RGB/RGBA even after `EXPAND`).
+        // Grayscale PNGs now stream as well.
         let gray = typst_dev_assets::get("screenshots/3-advanced-paper.png").unwrap();
         let gray = RasterImage::plain(Bytes::new(gray), ExchangeFormat::Png).unwrap();
-        assert!(gray.decode_rgba_row_range(0, 1).is_none());
+        assert_eq!(
+            gray.decode_rgba_row_range(0, 1).unwrap(),
+            gray.dynamic().to_rgba8().as_raw()[..gray.width() as usize * 4]
+        );
 
         // Note: an interlaced-PNG case is intentionally not covered here --
         // the `png` crate's `Writer::write_image_data` doesn't support

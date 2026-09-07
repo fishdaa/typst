@@ -876,7 +876,7 @@ fn render_and_encode_png_in_bands(
 /// With `render_threads > 1` the two halves of the work run concurrently: a
 /// spawned thread renders band `k + 1` (itself split into `render_threads` row
 /// tiles, see `typst_render::render_band_into`) while this thread filters and
-/// compresses band `k`. The band channel has capacity one, so the renderer can
+/// compresses band `k`. The band channel is unbuffered, so the renderer can
 /// only run one band ahead and at most two bands are ever alive -- which is
 /// what `band_budget` accounts for.
 ///
@@ -945,9 +945,10 @@ fn encode_bands(
         }
     } else {
         std::thread::scope(|scope| -> Result<(), png::EncodingError> {
-            // Capacity one: the renderer may be a single band ahead, never
-            // more, so exactly two bands can be alive at once.
-            let (band_tx, band_rx) = mpsc::sync_channel::<sk::Pixmap>(1);
+            // A rendezvous channel keeps at most two bands alive: the one
+            // being encoded and the one being rendered or handed over. A
+            // buffered channel would also retain a third, queued band.
+            let (band_tx, band_rx) = mpsc::sync_channel::<sk::Pixmap>(0);
 
             scope.spawn(move || {
                 let mut y = 0;

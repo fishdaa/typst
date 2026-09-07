@@ -156,12 +156,13 @@ fn derive_channels(raster: &RasterImage) -> Channels {
         && matches!(raster.format(), RasterFormat::Exchange(ExchangeFormat::Png))
     {
         let pixels = raster.width() as usize * raster.height() as usize;
-        let mut color = Vec::with_capacity(pixels * 3);
+        let is_rgb = !raster.is_grayscale();
+        let mut color = Vec::with_capacity(pixels * if is_rgb { 3 } else { 1 });
         let mut alpha = raster.has_alpha().then(|| Vec::with_capacity(pixels));
         if raster
             .for_each_rgba_row(0, raster.height(), |_, row| {
                 for px in row.chunks_exact(4) {
-                    color.extend_from_slice(&px[..3]);
+                    color.extend_from_slice(&px[..if is_rgb { 3 } else { 1 }]);
                     if let Some(alpha) = &mut alpha {
                         alpha.push(px[3]);
                     }
@@ -171,7 +172,7 @@ fn derive_channels(raster: &RasterImage) -> Channels {
         {
             return Channels {
                 color: ColorBuf::Owned(color),
-                is_rgb: true,
+                is_rgb,
                 alpha,
                 icc_valid: raster.is_native_8bit(),
             };
@@ -370,5 +371,54 @@ fn exif_transform(image: &RasterImage, size: Size) -> (Transform, Size) {
         Some(7) => with_flipping(true, true),
         Some(8) => with_flipping(true, false),
         _ => no_flipping(false, false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use typst_library::foundations::Bytes;
+
+    #[test]
+    fn streamed_grayscale_preserves_pdf_channels() {
+        for source in [
+            DynamicImage::ImageLuma8(
+                image::ImageBuffer::from_raw(2, 1, vec![0, 173]).unwrap(),
+            ),
+            DynamicImage::ImageLumaA8(
+                image::ImageBuffer::from_raw(2, 1, vec![42, 0, 173, 127]).unwrap(),
+            ),
+            DynamicImage::ImageLuma16(
+                image::ImageBuffer::from_raw(2, 1, vec![200, 32768]).unwrap(),
+            ),
+            DynamicImage::ImageLumaA16(
+                image::ImageBuffer::from_raw(2, 1, vec![200, 0, 32768, 40000]).unwrap(),
+            ),
+        ] {
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            source.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+            let raster = RasterImage::new(
+                Bytes::new(encoded.into_inner()),
+                ExchangeFormat::Png,
+                Smart::Custom(Bytes::new(vec![1, 2, 3])),
+            )
+            .unwrap();
+            let channels = derive_channels(&raster);
+            assert!(!channels.is_rgb);
+            assert_eq!(channels.color.as_bytes(), source.to_luma8().as_raw());
+            assert_eq!(
+                channels.icc_valid,
+                matches!(
+                    source,
+                    DynamicImage::ImageLuma8(_) | DynamicImage::ImageLumaA8(_)
+                )
+            );
+            assert_eq!(
+                channels.alpha,
+                source.color().has_alpha().then(|| {
+                    source.to_luma_alpha8().pixels().map(|p| p[1]).collect()
+                })
+            );
+        }
     }
 }

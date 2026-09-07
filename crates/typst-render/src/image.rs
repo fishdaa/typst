@@ -562,7 +562,7 @@ fn try_blit_resized_axis_aligned(
         // fails part-way through the file, `resize` rejects the pixel-type
         // mismatch and the `?` below hands the image to the general path,
         // which is the same fallback as any other unsupported source.
-        let src = to_rgba8(image)?;
+        let src = raster.rgba8();
         let opts = opts.crop(crop_left, crop_top, crop_width, crop_height);
         Resizer::new().resize(src.as_ref(), &mut resized, &opts).ok()?;
     }
@@ -594,15 +594,23 @@ fn try_blit_resized_axis_aligned(
         return Some(());
     }
 
+    eprintln!(
+        "DBG dst=({dst_w},{dst_h}) dst0=({dst_x0},{dst_y0}) clip=({clip_x0},{clip_y0},{clip_x1},{clip_y1}) local=({local_x0},{local_y0},{local_x1},{local_y1}) start=({start_x},{start_y}) end=({end_x},{end_y}) crop=({crop_w},{crop_h}) tile=({tile_w},{tile_h}) off=({offset_x},{offset_y}) buf={} canvas=({},{})",
+        buf.len(),
+        canvas.width(),
+        canvas.height()
+    );
     let mut tile = sk::Pixmap::new(tile_w, tile_h)?;
     for row in 0..tile_h {
-        let row_start = (((offset_y + row) * crop_w + offset_x) * 4) as usize;
-        let row_bytes = &buf[row_start..row_start + (tile_w as usize) * 4];
+        let row_start = ((offset_y + row) as usize * crop_w as usize + offset_x as usize)
+            * channels as usize;
+        let row_bytes = &buf[row_start..row_start + tile_w as usize * channels as usize];
         let dest_start = (row * tile_w) as usize;
         let dest_row = &mut tile.pixels_mut()[dest_start..dest_start + tile_w as usize];
-        for (chunk, dest) in row_bytes.chunks_exact(4).zip(dest_row) {
-            *dest = sk::ColorU8::from_rgba(chunk[0], chunk[1], chunk[2], chunk[3])
-                .premultiply();
+        for (chunk, dest) in row_bytes.chunks_exact(channels as usize).zip(dest_row) {
+            let alpha = if channels == 4 { chunk[3] } else { 255 };
+            *dest =
+                sk::ColorU8::from_rgba(chunk[0], chunk[1], chunk[2], alpha).premultiply();
         }
     }
 
@@ -626,7 +634,7 @@ fn try_blit_resized_axis_aligned(
 /// Without this, any rotated or skewed raster image (however slightly --
 /// even a fraction of a degree) fell through to the general path below,
 /// which always builds a texture sized to the *whole placed image* via
-/// `build_texture`/`to_rgba8`, regardless of how much of it actually
+/// `build_texture`/`RasterImage::rgba8`, regardless of how much of it actually
 /// overlaps the current canvas. For a page rendered in bands (see
 /// `render_band`), that's a whole-page-sized allocation on the very first
 /// band -- comemo then reuses it for subsequent bands (so it only happens
@@ -790,9 +798,16 @@ fn try_blit_resized_general(
         .crop(crop_left, local_crop_top, crop_width, crop_height);
     Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
 
-    let mut tile = sk::Pixmap::new(crop_w, crop_h)?;
-    for (src, dest) in resized.buffer().chunks_exact(4).zip(tile.pixels_mut()) {
-        *dest = sk::ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+    drop(region_img);
+
+    // Reuse the resize allocation as the texture instead of keeping a second
+    // RGBA buffer alive during compositing.
+    let mut tile =
+        sk::Pixmap::from_vec(resized.into_vec(), IntSize::from_wh(crop_w, crop_h)?)?;
+    for pixel in tile.data_mut().chunks_exact_mut(4) {
+        let color =
+            sk::ColorU8::from_rgba(pixel[0], pixel[1], pixel[2], pixel[3]).premultiply();
+        pixel.copy_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
     }
 
     // Paint the small tile with the *same* affine transform the unbounded
@@ -823,15 +838,6 @@ fn try_blit_resized_general(
     canvas.fill_rect(rect, &paint, ts, state.mask);
 
     Some(())
-}
-
-/// Converts a raster image to RGBA8, memoized so repeated calls (e.g. once
-/// per rendered band of a large page) reuse the same buffer instead of
-/// redecoding/reconverting the whole source image each time.
-#[comemo::memoize]
-fn to_rgba8(image: &Image) -> Option<Arc<image::RgbaImage>> {
-    let ImageKind::Raster(raster) = image.kind() else { return None };
-    Some(Arc::new(raster.dynamic().to_rgba8()))
 }
 
 /// Reserves a retained-row window on `raster` large enough to cover the whole
@@ -897,7 +903,7 @@ fn build_texture(image: &Image, w: u32, h: u32) -> Option<Arc<sk::Pixmap>> {
                 // `rayon` feature) parallelizes the convolution across
                 // threads, instead of `image`'s single-threaded scalar
                 // resize.
-                let src = to_rgba8(image)?;
+                let src = raster.rgba8();
                 let mut dst = FirImage::new(w, h, PixelType::U8x4);
                 // See the matching comment in
                 // `try_blit_resized_axis_aligned` for `use_alpha`.
@@ -979,4 +985,70 @@ fn build_pdf_texture(pdf: &PdfImage, w: u32, h: u32) -> Option<sk::Pixmap> {
 
     let bytes: Vec<u8> = bytemuck::cast_vec(hayro_pix.take());
     sk::Pixmap::from_vec(bytes, IntSize::from_wh(w, h)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::ImageEncoder;
+    use typst_library::foundations::Bytes;
+    use typst_library::visualize::ExchangeFormat;
+
+    fn solid_png(alpha: bool) -> Image {
+        let mut data = Vec::new();
+        let pixel = if alpha { &[120, 80, 40, 128][..] } else { &[120, 80, 40][..] };
+        image::codecs::png::PngEncoder::new(&mut data)
+            .write_image(
+                &pixel.repeat(32 * 32),
+                32,
+                32,
+                if alpha {
+                    image::ExtendedColorType::Rgba8
+                } else {
+                    image::ExtendedColorType::Rgb8
+                },
+            )
+            .unwrap();
+        Image::plain(RasterImage::plain(Bytes::new(data), ExchangeFormat::Png).unwrap())
+    }
+
+    #[test]
+    fn resized_masked_png_matches_unmasked_composite() {
+        for alpha in [false, true] {
+            for dimension in [16, 64] {
+                let image = solid_png(alpha);
+                let mut mask = sk::Mask::new(dimension, dimension).unwrap();
+                mask.data_mut().fill(255);
+                let state = State { mask: Some(&mask), ..State::default() };
+                let mut masked = sk::Pixmap::new(dimension, dimension).unwrap();
+                let mut reference = masked.clone();
+                masked.fill(sk::Color::WHITE);
+                reference.fill(sk::Color::WHITE);
+                try_blit_resized_axis_aligned(
+                    &mut masked.as_mut(),
+                    &state,
+                    &image,
+                    dimension as f32,
+                    dimension as f32,
+                )
+                .unwrap();
+                try_blit_resized_axis_aligned(
+                    &mut reference.as_mut(),
+                    &State::default(),
+                    &image,
+                    dimension as f32,
+                    dimension as f32,
+                )
+                .unwrap();
+                assert_eq!(masked.data(), reference.data());
+                let pixel = masked.pixel(0, 0).unwrap();
+                if !alpha {
+                    assert_eq!(
+                        (pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()),
+                        (120, 80, 40, 255)
+                    );
+                }
+            }
+        }
+    }
 }
