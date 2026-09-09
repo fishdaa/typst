@@ -441,9 +441,11 @@ fn run_once(
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let pid = child.id() as libc::pid_t;
     let start = Instant::now();
-    let (status, max_rss_kib) = wait4(pid)?;
+    #[cfg(unix)]
+    let (status, max_rss_kib) = wait4(child.id() as libc::pid_t)?;
+    #[cfg(not(unix))]
+    let (status, max_rss_kib) = (child.wait()?.code().unwrap_or(-1), 0);
     let elapsed_secs = start.elapsed().as_secs_f64();
 
     if !exited_successfully(status) {
@@ -461,6 +463,7 @@ fn run_once(
 /// Reaps the child ourselves via `wait4` (rather than `Child::wait`, which
 /// discards the kernel's rusage) so peak RSS comes straight from the OS
 /// instead of needing an external `/usr/bin/time`.
+#[cfg(unix)]
 fn wait4(pid: libc::pid_t) -> Result<(i32, u64), Box<dyn Error>> {
     let mut status: i32 = 0;
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };

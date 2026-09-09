@@ -457,6 +457,15 @@ impl Hasher for HasherRef<'_> {
     fn write(&mut self, bytes: &[u8]) {
         self.0.write(bytes);
     }
+
+    // Keep the stable-hash behavior of the wrapped hasher. In particular,
+    // `hash128` hashes `usize` as `u64` so its output is identical on 32-bit
+    // and 64-bit targets. Using the default `Hasher::write_usize` here would
+    // write only four bytes on 32-bit targets and would make paged bytes hash
+    // differently from ordinary bytes.
+    fn write_usize(&mut self, value: usize) {
+        self.0.write_usize(value);
+    }
 }
 
 impl<T> Bytelike for T
