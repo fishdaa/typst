@@ -198,16 +198,20 @@ fn with_db(
         })
         .collect();
 
+    // Keep the `Option` in the parallel result instead of using `filter_map`:
+    // the latter is unindexed, so collecting it does not preserve the face
+    // order. Font order is significant because it decides which face wins
+    // when several fonts match a query.
     faces
         .into_par_iter()
-        .filter_map(|(id, path, index)| {
-            let info = db
-                .with_face_data(id, FontInfo::new)
-                .expect("database must contain this font")?;
-            Some((FontPath { path, index }, info))
+        .map(|(id, path, index)| {
+            db.with_face_data(id, FontInfo::new)
+                .flatten()
+                .map(|info| (FontPath { path, index }, info))
         })
         .collect::<Vec<_>>()
         .into_iter()
+        .flatten()
 }
 
 /// Loads Adobe fonts available on the system. Only supported on Windows and

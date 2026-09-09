@@ -54,6 +54,7 @@ pub fn read_file(path: &Path) -> io::Result<Bytes> {
             // kernel to read ahead aggressively and drop pages behind the
             // read position on its own. Best-effort: an error here only
             // costs performance.
+            #[cfg(unix)]
             let _ = mmap.advise(memmap2::Advice::Sequential);
             Ok(Bytes::from_paged(MappedFile { mmap }))
         }
@@ -85,40 +86,44 @@ impl Paged for MappedFile {
     /// Stateless, so a range that a previous pass already released can be
     /// released again after a later pass faulted it back in.
     fn release(&self, range: Range<usize>) {
-        // Round the start up and the end down: a partially-consumed page at
-        // either edge is likely still in use by the caller.
-        let page = page_size();
-        let start = range.start.next_multiple_of(page);
-        let end = range.end.min(self.mmap.len()) & !(page - 1);
-        if end <= start {
-            return;
-        }
+        #[cfg(not(unix))]
+        let _ = range;
 
-        // SAFETY: `MADV_DONTNEED` is only unsafe for a mapping that can
-        // hold un-written-back data. This is a read-only private mapping of
-        // a file, so every page is clean and re-readable from the file, and
-        // `memmap2` hands out only shared references to it.
-        let _ = unsafe {
-            self.mmap.unchecked_advise_range(
-                memmap2::UncheckedAdvice::DontNeed,
-                start,
-                end - start,
-            )
-        };
+        #[cfg(unix)]
+        {
+            // Round the start up and the end down: a partially-consumed page at
+            // either edge is likely still in use by the caller.
+            let page = page_size();
+            let start = range.start.next_multiple_of(page);
+            let end = range.end.min(self.mmap.len()) & !(page - 1);
+            if end <= start {
+                return;
+            }
+
+            // SAFETY: `MADV_DONTNEED` is only unsafe for a mapping that can
+            // hold un-written-back data. This is a read-only private mapping of
+            // a file, so every page is clean and re-readable from the file, and
+            // `memmap2` hands out only shared references to it.
+            let _ = unsafe {
+                self.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    start,
+                    end - start,
+                )
+            };
+        }
     }
 }
 
 /// The system page size, which `advise_range` requires offsets to be aligned
 /// to. Falls back to 4 KiB, the near-universal value, if the query fails.
+#[cfg(unix)]
 fn page_size() -> usize {
-    #[cfg(unix)]
-    {
-        // SAFETY: `sysconf` is always safe to call; it only reads a system
-        // parameter.
-        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if size > 0 {
-            return size as usize;
-        }
+    // SAFETY: `sysconf` is always safe to call; it only reads a system
+    // parameter.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 {
+        return size as usize;
     }
     4096
 }
