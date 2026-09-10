@@ -222,7 +222,7 @@ fn try_blit_opaque(
     if clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
         // No overlap with the canvas at all (e.g. a band that this image
         // doesn't touch).
-        return None;
+        return Some(());
     }
 
     let canvas_w = canvas.width() as usize;
@@ -352,7 +352,7 @@ fn try_blit_native_alpha(
             let b = (row[idx + 2] as u32 * a + 127) / 255;
             let src = r | (g << 8) | (b << 16) | (a << 24);
             let dst = &mut pixels[py * canvas_w + (dst_x0 + sx as i64) as usize];
-            *dst = src + alpha_mul(*dst, 256 - (src >> 24));
+            *dst = src + alpha_mul(*dst, 255 - (src >> 24));
         }
     };
 
@@ -373,7 +373,7 @@ fn try_blit_native_alpha(
                     | (((b as u32 * a + 127) / 255) << 16)
                     | (a << 24);
                 let dst = &mut pixels[py * canvas_w + (dst_x0 + sx as i64) as usize];
-                *dst = src + alpha_mul(*dst, 256 - (src >> 24));
+                *dst = src + alpha_mul(*dst, 255 - (src >> 24));
             }
         }
     }
@@ -383,9 +383,13 @@ fn try_blit_native_alpha(
 
 fn alpha_mul(color: u32, scale: u32) -> u32 {
     let mask = 0xff00ff;
-    let rb = ((color & mask) * scale) >> 8;
-    let ag = ((color >> 8) & mask) * scale;
-    (rb & mask) | (ag & !mask)
+    // Match tiny-skia's low-precision source-over implementation:
+    // `(value * scale + 255) / 256`, where `scale` is the inverse source
+    // alpha (`255 - alpha`). The per-lane additions preserve the packed
+    // RGBA layout while providing the same rounding as tiny-skia's `div255`.
+    let rb = (((color & mask) * scale + 0x00ff00ff) >> 8) & mask;
+    let ag = ((((color >> 8) & mask) * scale + 0x00ff00ff) >> 8) << 8;
+    rb | (ag & !mask)
 }
 
 /// Fast path for a raster image that needs resampling (i.e. doesn't qualify
@@ -1042,6 +1046,17 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn alpha_mul_matches_tiny_skia_rounding() {
+        for scale in [0, 1, 32, 127, 128, 200, 255] {
+            let color = 1 | (37 << 8) | (128 << 16) | (255 << 24);
+            let actual = alpha_mul(color, scale);
+            let expected =
+                [1_u32, 37, 128, 255].map(|value| ((value * scale + 255) >> 8) as u8);
+            assert_eq!(actual.to_le_bytes(), expected, "scale {scale}");
         }
     }
 }
