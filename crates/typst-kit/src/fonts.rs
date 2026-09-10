@@ -9,6 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+#[cfg(feature = "scan-fonts")]
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 #[cfg(feature = "embedded-fonts")]
 use typst_library::foundations::Bytes;
 use typst_library::text::{Font, FontBook, FontInfo};
@@ -174,25 +176,42 @@ fn with_db(
 ) -> impl Iterator<Item = (FontPath, FontInfo)> {
     let mut db = fontdb::Database::new();
     f(&mut db);
-    db.faces()
-        .filter_map(|face| {
-            let path = match &face.source {
-                fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path,
-                // We never add binary sources to the database, so there
-                // shouldn't be any.
-                fontdb::Source::Binary(_) => return None,
-            };
 
-            let info = db
-                .with_face_data(face.id, FontInfo::new)
-                .expect("database must contain this font")?;
+    // Parsing every discovered face's metadata is a meaningful share of
+    // start-up on a machine with many system fonts, and it happens before any
+    // page can be laid out -- so it is pure serial latency, which matters most
+    // on a cold start. The faces are independent, so parse them in parallel.
+    //
+    // The order of the result is preserved, because it becomes the order of
+    // the `FontBook` and therefore decides which face wins when several match
+    // a query. Rayon's `collect` into a `Vec` preserves the input order, so
+    // this stays deterministic regardless of how the work is scheduled.
+    let faces: Vec<_> = db
+        .faces()
+        .filter_map(|face| match &face.source {
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                Some((face.id, path.clone(), face.index))
+            }
+            // We never add binary sources to the database, so there
+            // shouldn't be any.
+            fontdb::Source::Binary(_) => None,
+        })
+        .collect();
 
-            let path = FontPath { path: path.clone(), index: face.index };
-
-            Some((path, info))
+    // Keep the `Option` in the parallel result instead of using `filter_map`:
+    // the latter is unindexed, so collecting it does not preserve the face
+    // order. Font order is significant because it decides which face wins
+    // when several fonts match a query.
+    faces
+        .into_par_iter()
+        .map(|(id, path, index)| {
+            db.with_face_data(id, FontInfo::new)
+                .flatten()
+                .map(|info| (FontPath { path, index }, info))
         })
         .collect::<Vec<_>>()
         .into_iter()
+        .flatten()
 }
 
 /// Loads Adobe fonts available on the system. Only supported on Windows and

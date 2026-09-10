@@ -17,10 +17,27 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [upstream, fork] = args.as_slice() else {
-        eprintln!("usage: typst-bench UPSTREAM_TYPST FORK_TYPST");
+    if args.len() < 2 {
+        eprintln!(
+            "usage: typst-bench BASELINE_TYPST TYPST [TYPST ...]\n\
+             \n\
+             Each argument is a path to a Typst binary, optionally as\n\
+             LABEL=PATH. The first one is the baseline (assumed to be\n\
+             upstream): scenarios that use fork-only flags are skipped for\n\
+             it and run for every later binary."
+        );
         std::process::exit(2);
-    };
+    }
+
+    let binaries: Vec<(String, String)> = args
+        .iter()
+        .enumerate()
+        .map(|(index, arg)| match arg.split_once('=') {
+            Some((label, path)) => (label.to_string(), path.to_string()),
+            None if index == 0 => ("baseline".to_string(), arg.clone()),
+            None => (format!("binary{}", index + 1), arg.clone()),
+        })
+        .collect();
 
     let warmup = env_u32("TYPST_BENCH_WARMUP", 1);
     let runs = env_u32("TYPST_BENCH_RUNS", 5);
@@ -35,39 +52,135 @@ fn run() -> Result<(), Box<dyn Error>> {
     write_fixtures(root, width, height)?;
 
     let mut rows = Vec::new();
-    for (name, binary) in [("upstream", upstream.as_str()), ("fork", fork.as_str())] {
-        for scenario in ["opaque", "alpha", "svg"] {
-            rows.push(report(root, name, binary, scenario, scenario, &[], warmup, runs)?);
+    for (index, (name, binary)) in binaries.iter().enumerate() {
+        for scenario in SCENARIOS {
+            if scenario.fork_only && index == 0 {
+                continue;
+            }
+            rows.push(report(root, name, binary, scenario, warmup, runs)?);
         }
     }
-    rows.push(report(
-        root,
-        "fork",
-        fork,
-        "constrained",
-        "opaque",
-        &["--max-memory", "512"],
-        warmup,
-        runs,
-    )?);
-    // Isolates the memory/time win of the rendering path from the effect of
-    // the fork's default `--png-compression fast` (vs. upstream's harder,
-    // slower default): same fixture and binary as the `opaque` row above,
-    // just re-encoded at `high` effort.
-    rows.push(report(
-        root,
-        "fork",
-        fork,
-        "high-compression",
-        "opaque",
-        &["--png-compression", "high"],
-        warmup,
-        runs,
-    )?);
 
     print_table(&rows);
     Ok(())
 }
+
+/// One measured configuration.
+struct Scenario {
+    /// The row label.
+    label: &'static str,
+    /// Which `.typ` fixture to compile.
+    fixture: &'static str,
+    /// The `--ppi` to compile at.
+    ///
+    /// A page `N` points wide at 72 ppi is exactly `N` device pixels, so a
+    /// full-bleed asset of the same pixel size lands at its native
+    /// resolution and needs no resampling. Any other value puts the same
+    /// asset through the resampling path instead, which is both the more
+    /// realistic case (a poster's assets rarely match the output grid
+    /// exactly) and a materially different code path, so it is measured
+    /// separately.
+    ppi: &'static str,
+    /// Extra CLI arguments.
+    extra: &'static [&'static str],
+    /// Whether this scenario uses flags only the fork has, and so must be
+    /// skipped for the baseline binary.
+    fork_only: bool,
+}
+
+const SCENARIOS: &[Scenario] = &[
+    // Background alone, at native resolution: the simplest large-asset case.
+    Scenario {
+        label: "opaque",
+        fixture: "opaque",
+        ppi: "72",
+        extra: &[],
+        fork_only: false,
+    },
+    Scenario {
+        label: "alpha",
+        fixture: "alpha",
+        ppi: "72",
+        extra: &[],
+        fork_only: false,
+    },
+    Scenario {
+        label: "svg",
+        fixture: "svg",
+        ppi: "72",
+        extra: &[],
+        fork_only: false,
+    },
+    // The shape real documents have: a full-bleed background with text and
+    // data drawn on top of it.
+    Scenario {
+        label: "poster",
+        fixture: "poster",
+        ppi: "72",
+        extra: &[],
+        fork_only: false,
+    },
+    // The same poster with the background resampled rather than blitted at
+    // native resolution -- see `Scenario::ppi`.
+    Scenario {
+        label: "poster-scaled",
+        fixture: "poster",
+        ppi: "71",
+        extra: &[],
+        fork_only: false,
+    },
+    // The render-thread sweep: `--render-threads 1` is the strictly
+    // sequential render-then-encode loop this fork used to have, so it is the
+    // reference point for what tiling and the render/encode pipeline buy. The
+    // plain `poster` rows above use the flag's default.
+    Scenario {
+        label: "poster-rt1",
+        fixture: "poster",
+        ppi: "72",
+        extra: &["--render-threads", "1"],
+        fork_only: true,
+    },
+    Scenario {
+        label: "poster-rt8",
+        fixture: "poster",
+        ppi: "72",
+        extra: &["--render-threads", "8"],
+        fork_only: true,
+    },
+    Scenario {
+        label: "poster-scaled-rt1",
+        fixture: "poster",
+        ppi: "71",
+        extra: &["--render-threads", "1"],
+        fork_only: true,
+    },
+    Scenario {
+        label: "poster-scaled-rt8",
+        fixture: "poster",
+        ppi: "71",
+        extra: &["--render-threads", "8"],
+        fork_only: true,
+    },
+    Scenario {
+        label: "constrained",
+        fixture: "poster",
+        ppi: "71",
+        extra: &["--max-memory", "512"],
+        fork_only: true,
+    },
+    // Isolates the memory/time win of the rendering path from the effect of
+    // the fork's default `--png-compression fast`: same fixture as
+    // `opaque`, re-encoded at `balanced`, which is the effort the `png`
+    // crate (and so the baseline) uses by default. Without this row, part of
+    // `opaque`'s time gap is just the cheaper compression default.
+    Scenario {
+        label: "balanced",
+        fixture: "opaque",
+        ppi: "72",
+        extra: &["--png-compression", "balanced"],
+        fork_only: true,
+    },
+];
 
 struct Row {
     binary: String,
@@ -154,12 +267,59 @@ fn write_fixtures(root: &Path, width: u32, height: u32) -> Result<(), Box<dyn Er
             ),
         )?;
     }
+
+    // Report what was generated: the asset's compression ratio decides how
+    // much of the measured time is real inflate/deflate work, so it belongs
+    // in the run's own output rather than only in the harness's source.
+    for name in ["opaque.png", "alpha.png"] {
+        let path = root.join(name);
+        let bytes = fs::metadata(&path)?.len();
+        let channels = if name.starts_with("alpha") { 4 } else { 3 };
+        let raw = width as u64 * height as u64 * channels;
+        eprintln!(
+            "fixture {name}: {} ({:.2}x compression of {})",
+            fmt_size(bytes),
+            raw as f64 / bytes.max(1) as f64,
+            fmt_size(raw),
+        );
+    }
+
+    // A full-bleed background with text and data drawn over it, which is
+    // what documents in this shape actually look like -- and which makes the
+    // per-band cost of re-walking the page's contents visible, where a
+    // background-only fixture hides it.
+    let rows = (height / 40).clamp(1, 400);
+    let mut poster = format!(
+        "#set page(width: {width}pt, height: {height}pt, margin: 0pt)\n\
+         #place(top + left, image(\"opaque.png\", width: 100%, height: 100%))\n"
+    );
+    for row in 0..rows {
+        let dy = row * (height / rows.max(1));
+        let value = (row * 137) % 991;
+        poster.push_str(&format!(
+            "#place(top + left, dx: 64pt, dy: {dy}pt, \
+             text(size: 24pt, fill: white)[Row {row} -- measured value {value}])\n"
+        ));
+    }
+    fs::write(root.join("poster.typ"), poster)?;
+
     Ok(())
 }
 
 /// Streams rows straight into the PNG encoder instead of building a
 /// full-size buffer first, since the benchmark's own point is exercising the
 /// bounded-memory path rather than defeating it while generating fixtures.
+///
+/// The content is built to compress roughly like a photograph -- about
+/// three-fold at the default size, in the range a PNG of real photographic
+/// content achieves. That matters in both directions: a flat-color fixture
+/// compresses several hundred-fold, making both inflating the source and
+/// deflating the output nearly free, while pure per-pixel noise is
+/// incompressible and makes them nearly memcpy-cheap instead. Either way the
+/// compression work a large-asset benchmark exists to measure disappears. So
+/// the content here is a smooth gradient plus *spatially coherent* noise
+/// (one value per 8x8 block, and a small dither on top), which is close to
+/// what PNG's row filters see in a photograph.
 fn write_png(
     path: &Path,
     width: u32,
@@ -170,21 +330,48 @@ fn write_png(
     let mut encoder = png::Encoder::new(file, width, height);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_color(if alpha { png::ColorType::Rgba } else { png::ColorType::Rgb });
+    encoder.set_compression(png::Compression::Fast);
     let mut writer = encoder.write_header()?.into_stream_writer()?;
 
-    let pixel: &[u8] =
-        if alpha { &[0x30, 0x60, 0x90, 0x80] } else { &[0x30, 0x60, 0x90] };
-    let row: Vec<u8> = pixel
-        .iter()
-        .copied()
-        .cycle()
-        .take(pixel.len() * width as usize)
-        .collect();
-    for _ in 0..height {
+    let channels = if alpha { 4 } else { 3 };
+    let mut row = vec![0_u8; width as usize * channels];
+    for y in 0..height {
+        for x in 0..width {
+            // A deterministic hash of the coarse block coordinates, so the
+            // noise is coherent over 8x8 pixel blocks rather than
+            // independent per pixel.
+            let block = hash32(x / 8, y / 8);
+            let coarse = (block % 33) as i32 - 16;
+            let dither = (hash32(x, y) % 3) as i32 - 1;
+
+            let base_r = (x * 255 / width.max(1)) as i32;
+            let base_g = (y * 255 / height.max(1)) as i32;
+            let base_b = 128 + (base_r - base_g) / 3;
+
+            let offset = x as usize * channels;
+            row[offset] = (base_r + coarse + dither).clamp(0, 255) as u8;
+            row[offset + 1] = (base_g + coarse - dither).clamp(0, 255) as u8;
+            row[offset + 2] = (base_b + coarse).clamp(0, 255) as u8;
+            if alpha {
+                row[offset + 3] = 0xff;
+            }
+        }
         writer.write_all(&row)?;
     }
     writer.finish()?;
     Ok(())
+}
+
+/// A small deterministic integer hash (a 2D variant of the finalizer from
+/// `MurmurHash3`), used to make fixture noise reproducible across runs and
+/// machines without pulling in a random-number generator.
+fn hash32(x: u32, y: u32) -> u32 {
+    let mut h = x.wrapping_mul(0x85eb_ca6b) ^ y.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7feb_352d);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846c_a68b);
+    h ^ (h >> 16)
 }
 
 struct Sample {
@@ -196,22 +383,20 @@ fn report(
     root: &Path,
     binary_name: &str,
     binary: &str,
-    label: &str,
-    fixture: &str,
-    extra_args: &[&str],
+    scenario: &Scenario,
     warmup: u32,
     runs: u32,
 ) -> Result<Row, Box<dyn Error>> {
-    let source = root.join(format!("{fixture}.typ"));
-    let output = root.join(format!("{binary_name}-{label}.png"));
+    let source = root.join(format!("{}.typ", scenario.fixture));
+    let output = root.join(format!("{binary_name}-{}.png", scenario.label));
 
     for _ in 0..warmup {
-        run_once(binary, &source, &output, extra_args)?;
+        run_once(binary, &source, &output, scenario)?;
     }
 
     let mut samples = Vec::with_capacity(runs as usize);
     for _ in 0..runs {
-        samples.push(run_once(binary, &source, &output, extra_args)?);
+        samples.push(run_once(binary, &source, &output, scenario)?);
     }
 
     let mean_secs =
@@ -219,7 +404,10 @@ fn report(
     let variance = if samples.len() > 1 {
         samples
             .iter()
-            .map(|s| (s.elapsed_secs - mean_secs).powi(2))
+            .map(|s| {
+                let deviation = s.elapsed_secs - mean_secs;
+                deviation * deviation
+            })
             .sum::<f64>()
             / (samples.len() - 1) as f64
     } else {
@@ -230,7 +418,7 @@ fn report(
 
     Ok(Row {
         binary: binary_name.into(),
-        scenario: label.into(),
+        scenario: scenario.label.into(),
         mean_secs,
         stddev_secs: variance.sqrt(),
         max_rss_kib,
@@ -242,20 +430,22 @@ fn run_once(
     binary: &str,
     source: &Path,
     output: &PathBuf,
-    extra_args: &[&str],
+    scenario: &Scenario,
 ) -> Result<Sample, Box<dyn Error>> {
     let mut child = Command::new(binary)
-        .args(["compile", "-j", "1", "--ppi", "72"])
-        .args(extra_args)
+        .args(["compile", "-j", "1", "--ppi", scenario.ppi])
+        .args(scenario.extra)
         .arg(source)
         .arg(output)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let pid = child.id() as libc::pid_t;
     let start = Instant::now();
-    let (status, max_rss_kib) = wait4(pid)?;
+    #[cfg(unix)]
+    let (status, max_rss_kib) = wait4(child.id() as libc::pid_t)?;
+    #[cfg(not(unix))]
+    let (status, max_rss_kib) = (child.wait()?.code().unwrap_or(-1), 0);
     let elapsed_secs = start.elapsed().as_secs_f64();
 
     if !exited_successfully(status) {
@@ -273,6 +463,7 @@ fn run_once(
 /// Reaps the child ourselves via `wait4` (rather than `Child::wait`, which
 /// discards the kernel's rusage) so peak RSS comes straight from the OS
 /// instead of needing an external `/usr/bin/time`.
+#[cfg(unix)]
 fn wait4(pid: libc::pid_t) -> Result<(i32, u64), Box<dyn Error>> {
     let mut status: i32 = 0;
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };

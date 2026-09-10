@@ -11,13 +11,13 @@ use tiny_skia as sk;
 use tiny_skia::IntSize;
 use typst_library::foundations::Smart;
 use typst_library::layout::Size;
-use typst_library::visualize::{Image, ImageKind, ImageScaling, PdfImage};
+use typst_library::visualize::{Image, ImageKind, ImageScaling, PdfImage, RasterImage};
 
 use crate::{AbsExt, State};
 
 /// Render a raster or SVG image into the canvas.
 pub fn render_image(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: State,
     image: &Image,
     size: Size,
@@ -93,7 +93,7 @@ pub fn render_image(
 /// one render band, so resvg clips the result to the visible portion and keeps
 /// memory proportional to the output band rather than the full SVG size.
 fn try_render_svg(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -133,7 +133,7 @@ fn try_render_svg(
             Some(mask),
         );
     } else {
-        resvg::render(svg.tree(), transform, &mut canvas.as_mut());
+        resvg::render(svg.tree(), transform, canvas);
     }
 
     Some(())
@@ -155,7 +155,7 @@ fn try_render_svg(
 /// Returns `None` (with no side effects) whenever a precondition doesn't
 /// hold, so callers should fall back to the general path unchanged.
 fn try_blit_opaque(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -222,7 +222,7 @@ fn try_blit_opaque(
     if clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
         // No overlap with the canvas at all (e.g. a band that this image
         // doesn't touch).
-        return None;
+        return Some(());
     }
 
     let canvas_w = canvas.width() as usize;
@@ -232,25 +232,33 @@ fn try_blit_opaque(
     let src_y_range = (clip_y0 - dst_y0) as u32..(clip_y1 - dst_y0) as u32;
     let src_x_range = (clip_x0 - dst_x0) as u32..(clip_x1 - dst_x0) as u32;
 
-    // Try to decode just the rows this band/canvas actually needs, so a
+    reserve_band_rows(raster, state, src_y_range.len() as u32, src_y_range.len() as u32);
+
+    // Stream in just the rows this band/canvas actually needs, so a
     // full-page-sized source image never has to be fully decoded and held
-    // in memory at once (see `RasterImage::decode_rgba_row_range`). Falls
-    // back to the fully decoded image when the source doesn't qualify
-    // (not PNG, interlaced, EXIF-rotated, etc.).
-    if let Some(rows) = raster.decode_rgba_row_range(src_y_range.start, src_y_range.end) {
-        let pixels = canvas.pixels_mut();
-        for sy in src_y_range.clone() {
+    // in memory at once, and no whole-band copy of it exists either (see
+    // `RasterImage::for_each_rgba_row`). Falls back to the fully decoded
+    // image when the source doesn't qualify (not PNG, interlaced,
+    // EXIF-rotated, etc.).
+    //
+    // Each row is copied in one `copy_from_slice`: an opaque source's rows
+    // arrive as `[r, g, b, 255]`, which is byte-for-byte what tiny-skia
+    // stores for that pixel (`PremultipliedColorU8` is `[r, g, b, a]`, and
+    // premultiplying by an alpha of 1 is the identity), so no per-pixel
+    // conversion is needed.
+    let byte_count = src_x_range.len() * 4;
+    let src_byte_offset = src_x_range.start as usize * 4;
+    let dst_x = (dst_x0 + src_x_range.start as i64) as usize;
+    let data = canvas.data_mut();
+    let streamed =
+        raster.for_each_rgba_row(src_y_range.start, src_y_range.end, |sy, row| {
             let py = (dst_y0 + sy as i64) as usize;
-            let row_off = (sy - src_y_range.start) as usize * src_w as usize * 4;
-            for sx in src_x_range.clone() {
-                let px = (dst_x0 + sx as i64) as usize;
-                let idx = row_off + sx as usize * 4;
-                let (r, g, b) = (rows[idx], rows[idx + 1], rows[idx + 2]);
-                pixels[py * canvas_w + px] =
-                    sk::ColorU8::from_rgba(r, g, b, 255).premultiply();
-            }
-        }
-    } else {
+            let start = (py * canvas_w + dst_x) * 4;
+            data[start..start + byte_count]
+                .copy_from_slice(&row[src_byte_offset..src_byte_offset + byte_count]);
+        });
+
+    if streamed.is_none() {
         let dynamic = raster.dynamic();
         let pixels = canvas.pixels_mut();
         for sy in src_y_range {
@@ -274,7 +282,7 @@ fn try_blit_opaque(
 /// not need a full-size texture: decode the rows visible in this band and
 /// blend them directly into the destination canvas.
 fn try_blit_native_alpha(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -329,6 +337,9 @@ fn try_blit_native_alpha(
 
     let src_y_range = (clip_y0 - dst_y0) as u32..(clip_y1 - dst_y0) as u32;
     let src_x_range = (clip_x0 - dst_x0) as u32..(clip_x1 - dst_x0) as u32;
+
+    reserve_band_rows(raster, state, src_y_range.len() as u32, src_y_range.len() as u32);
+
     let canvas_w = canvas.width() as usize;
     let pixels = bytemuck::cast_slice_mut::<u8, u32>(canvas.data_mut());
     let mut blend_row = |sy: u32, row: &[u8]| {
@@ -341,7 +352,7 @@ fn try_blit_native_alpha(
             let b = (row[idx + 2] as u32 * a + 127) / 255;
             let src = r | (g << 8) | (b << 16) | (a << 24);
             let dst = &mut pixels[py * canvas_w + (dst_x0 + sx as i64) as usize];
-            *dst = src + alpha_mul(*dst, 256 - (src >> 24));
+            *dst = src + alpha_mul(*dst, 255 - (src >> 24));
         }
     };
 
@@ -362,7 +373,7 @@ fn try_blit_native_alpha(
                     | (((b as u32 * a + 127) / 255) << 16)
                     | (a << 24);
                 let dst = &mut pixels[py * canvas_w + (dst_x0 + sx as i64) as usize];
-                *dst = src + alpha_mul(*dst, 256 - (src >> 24));
+                *dst = src + alpha_mul(*dst, 255 - (src >> 24));
             }
         }
     }
@@ -372,9 +383,13 @@ fn try_blit_native_alpha(
 
 fn alpha_mul(color: u32, scale: u32) -> u32 {
     let mask = 0xff00ff;
-    let rb = ((color & mask) * scale) >> 8;
-    let ag = ((color >> 8) & mask) * scale;
-    (rb & mask) | (ag & !mask)
+    // Match tiny-skia's low-precision source-over implementation:
+    // `(value * scale + 255) / 256`, where `scale` is the inverse source
+    // alpha (`255 - alpha`). The per-lane additions preserve the packed
+    // RGBA layout while providing the same rounding as tiny-skia's `div255`.
+    let rb = (((color & mask) * scale + 0x00ff00ff) >> 8) & mask;
+    let ag = ((((color >> 8) & mask) * scale + 0x00ff00ff) >> 8) << 8;
+    rb | (ag & !mask)
 }
 
 /// Fast path for a raster image that needs resampling (i.e. doesn't qualify
@@ -400,7 +415,7 @@ fn alpha_mul(color: u32, scale: u32) -> u32 {
 /// Returns `None` (with no side effects) whenever a precondition doesn't
 /// hold, so callers should fall back to the general path unchanged.
 fn try_blit_resized_axis_aligned(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -498,17 +513,40 @@ fn try_blit_resized_axis_aligned(
 
     // Try to decode only the source rows this crop actually needs, so a
     // full-page-sized source image never has to be fully decoded and held
-    // in memory at once (see `RasterImage::decode_rgba_row_range`). Falls
+    // in memory at once (see `RasterImage::decode_row_range`). Falls
     // back to the fully decoded, fully converted buffer when the source
     // doesn't qualify (not PNG, interlaced, EXIF-rotated, etc.).
+    //
+    // A source without an alpha channel is decoded and resized as three
+    // channels rather than four, which is a quarter less memory in both the
+    // decoded region and the resize target -- the two largest buffers this
+    // path holds, and both proportional to the band size.
+    let channels: u8 =
+        if !raster.has_alpha() && raster.supports_row_range(3) { 3 } else { 4 };
+    let pixel_type = if channels == 3 { PixelType::U8x3 } else { PixelType::U8x4 };
+
     let row_lo = crop_top.floor().max(0.0) as u32;
     let row_hi = (crop_top + crop_height).ceil().min(src_h as f64) as u32;
-    let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
-    let opts = ResizeOptions::new().resize_alg(alg);
-    if let Some(region) = raster.decode_rgba_row_range(row_lo, row_hi) {
+
+    reserve_band_rows(
+        raster,
+        state,
+        (local_y1 - local_y0) as u32,
+        row_hi.saturating_sub(row_lo),
+    );
+
+    let mut resized = FirImage::new(crop_w, crop_h, pixel_type);
+    // `fast_image_resize` premultiplies by alpha before convolving and
+    // divides it back out afterwards, so transparent pixels don't bleed their
+    // color into their neighbors. For a source whose alpha is uniformly 255
+    // both passes are exact identities -- multiplying by one, then dividing
+    // by one -- so they can be skipped outright, saving two full passes over
+    // the region for the common case of an opaque photographic background.
+    let opts = ResizeOptions::new().resize_alg(alg).use_alpha(raster.has_alpha());
+    if let Some(region) = raster.decode_row_range(row_lo, row_hi, channels) {
         let region_h = row_hi - row_lo;
         let region_img =
-            FirImage::from_vec_u8(src_w, region_h, region, PixelType::U8x4).ok()?;
+            FirImage::from_vec_u8(src_w, region_h, region, pixel_type).ok()?;
         // `row_hi`/the region's actual height are clamped to `src_h`, but
         // `crop_height` (and, symmetrically, `crop_width` against `src_w`)
         // are derived from the destination-side margin before that clamp,
@@ -522,24 +560,55 @@ fn try_blit_resized_axis_aligned(
         let opts = opts.crop(crop_left, local_crop_top, crop_width, crop_height);
         Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
     } else {
-        let src = to_rgba8(image)?;
+        // `supports_row_range` already reported that the row-range path
+        // applies whenever `channels` is 3, so in practice this fallback
+        // only runs with a 4-channel `resized`. If a decode nonetheless
+        // fails part-way through the file, `resize` rejects the pixel-type
+        // mismatch and the `?` below hands the image to the general path,
+        // which is the same fallback as any other unsupported source.
+        let src = raster.rgba8();
         let opts = opts.crop(crop_left, crop_top, crop_width, crop_height);
         Resizer::new().resize(src.as_ref(), &mut resized, &opts).ok()?;
     }
 
     let (tile_w, tile_h) = ((clip_x1 - clip_x0) as u32, (clip_y1 - clip_y0) as u32);
-    let mut tile = sk::Pixmap::new(tile_w, tile_h)?;
     let offset_x = (local_x0 as u32) - start_x;
     let offset_y = (local_y0 as u32) - start_y;
     let buf = resized.buffer();
+
+    // With no mask and no alpha, `src over dst` is just `src`, so the
+    // resized pixels can go straight into the canvas -- skipping both a
+    // second band-sized pixmap and the compositing pass over it. This is the
+    // common case for a full-bleed opaque background.
+    if state.mask.is_none() && channels == 3 {
+        let canvas_w = canvas.width() as usize;
+        let data = canvas.data_mut();
+        for row in 0..tile_h {
+            let src_start = (((offset_y + row) * crop_w + offset_x) * 3) as usize;
+            let src_row = &buf[src_start..src_start + (tile_w as usize) * 3];
+            let dest_start =
+                ((clip_y0 as usize + row as usize) * canvas_w + clip_x0 as usize) * 4;
+            let dest_row = &mut data[dest_start..dest_start + (tile_w as usize) * 4];
+            for (chunk, dest) in src_row.chunks_exact(3).zip(dest_row.chunks_exact_mut(4))
+            {
+                dest[..3].copy_from_slice(chunk);
+                dest[3] = 255;
+            }
+        }
+        return Some(());
+    }
+
+    let mut tile = sk::Pixmap::new(tile_w, tile_h)?;
     for row in 0..tile_h {
-        let row_start = (((offset_y + row) * crop_w + offset_x) * 4) as usize;
-        let row_bytes = &buf[row_start..row_start + (tile_w as usize) * 4];
+        let row_start = ((offset_y + row) as usize * crop_w as usize + offset_x as usize)
+            * channels as usize;
+        let row_bytes = &buf[row_start..row_start + tile_w as usize * channels as usize];
         let dest_start = (row * tile_w) as usize;
         let dest_row = &mut tile.pixels_mut()[dest_start..dest_start + tile_w as usize];
-        for (chunk, dest) in row_bytes.chunks_exact(4).zip(dest_row) {
-            *dest = sk::ColorU8::from_rgba(chunk[0], chunk[1], chunk[2], chunk[3])
-                .premultiply();
+        for (chunk, dest) in row_bytes.chunks_exact(channels as usize).zip(dest_row) {
+            let alpha = if channels == 4 { chunk[3] } else { 255 };
+            *dest =
+                sk::ColorU8::from_rgba(chunk[0], chunk[1], chunk[2], alpha).premultiply();
         }
     }
 
@@ -563,7 +632,7 @@ fn try_blit_resized_axis_aligned(
 /// Without this, any rotated or skewed raster image (however slightly --
 /// even a fraction of a degree) fell through to the general path below,
 /// which always builds a texture sized to the *whole placed image* via
-/// `build_texture`/`to_rgba8`, regardless of how much of it actually
+/// `build_texture`/`RasterImage::rgba8`, regardless of how much of it actually
 /// overlaps the current canvas. For a page rendered in bands (see
 /// `render_band`), that's a whole-page-sized allocation on the very first
 /// band -- comemo then reuses it for subsequent bands (so it only happens
@@ -577,7 +646,7 @@ fn try_blit_resized_axis_aligned(
 /// interlaced, EXIF-rotated, or
 /// non-PNG), so callers fall back to the general path unchanged.
 fn try_blit_resized_general(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: &State,
     image: &Image,
     view_width: f32,
@@ -700,6 +769,13 @@ fn try_blit_resized_general(
     let row_lo = crop_top.floor().max(0.0) as u32;
     let row_hi = (crop_top + crop_height).ceil().min(src_h as f64) as u32;
 
+    reserve_band_rows(
+        raster,
+        state,
+        (local_y1 - local_y0) as u32,
+        row_hi.saturating_sub(row_lo),
+    );
+
     let region = raster.decode_rgba_row_range(row_lo, row_hi)?;
     let region_h = row_hi - row_lo;
     let region_img =
@@ -713,17 +789,23 @@ fn try_blit_resized_general(
     let crop_width = crop_width.min(src_w as f64 - crop_left);
 
     let mut resized = FirImage::new(crop_w, crop_h, PixelType::U8x4);
-    let opts = ResizeOptions::new().resize_alg(alg).crop(
-        crop_left,
-        local_crop_top,
-        crop_width,
-        crop_height,
-    );
+    // See the matching comment in `try_blit_resized_axis_aligned`.
+    let opts = ResizeOptions::new()
+        .resize_alg(alg)
+        .use_alpha(raster.has_alpha())
+        .crop(crop_left, local_crop_top, crop_width, crop_height);
     Resizer::new().resize(&region_img, &mut resized, &opts).ok()?;
 
-    let mut tile = sk::Pixmap::new(crop_w, crop_h)?;
-    for (src, dest) in resized.buffer().chunks_exact(4).zip(tile.pixels_mut()) {
-        *dest = sk::ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+    drop(region_img);
+
+    // Reuse the resize allocation as the texture instead of keeping a second
+    // RGBA buffer alive during compositing.
+    let mut tile =
+        sk::Pixmap::from_vec(resized.into_vec(), IntSize::from_wh(crop_w, crop_h)?)?;
+    for pixel in tile.data_mut().chunks_exact_mut(4) {
+        let color =
+            sk::ColorU8::from_rgba(pixel[0], pixel[1], pixel[2], pixel[3]).premultiply();
+        pixel.copy_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
     }
 
     // Paint the small tile with the *same* affine transform the unbounded
@@ -756,13 +838,31 @@ fn try_blit_resized_general(
     Some(())
 }
 
-/// Converts a raster image to RGBA8, memoized so repeated calls (e.g. once
-/// per rendered band of a large page) reuse the same buffer instead of
-/// redecoding/reconverting the whole source image each time.
-#[comemo::memoize]
-fn to_rgba8(image: &Image) -> Option<Arc<image::RgbaImage>> {
-    let ImageKind::Raster(raster) = image.kind() else { return None };
-    Some(Arc::new(raster.dynamic().to_rgba8()))
+/// Reserves a retained-row window on `raster` large enough to cover the whole
+/// band this canvas belongs to, rather than just this canvas's own rows.
+///
+/// The tiles of one band are rendered concurrently
+/// (see `typst_render::render_band_into`), so they reach a raster image's
+/// single sequential row cursor in an arbitrary order: whichever tile arrives
+/// first pulls the cursor down to its own rows, and every tile above it then
+/// asks for rows the cursor has already passed. Without a window that spans
+/// the band, each of those would restart decompression from row 0 and make a
+/// tiled band cost `O(tiles * height)` row decodes instead of `O(height)`.
+///
+/// `dst_rows` and `src_rows` are this request's own destination and source row
+/// counts, so the ratio between them extrapolates the band's height into
+/// source rows without this function needing to know which coordinate space
+/// the caller works in.
+fn reserve_band_rows(raster: &RasterImage, state: &State, dst_rows: u32, src_rows: u32) {
+    if state.band_rows == 0 || dst_rows == 0 {
+        return;
+    }
+    // `src_rows` covers this request's own rows plus the resample filter's
+    // margin on both sides, so the ratio is already an over-estimate of the
+    // band's source rows and needs no further slack added on top.
+    let per_row = src_rows as f64 / dst_rows as f64;
+    let rows = (state.band_rows as f64 * per_row).ceil();
+    raster.reserve_retained_rows(rows.min(u32::MAX as f64) as u32);
 }
 
 /// Prepare a texture for an image at a scaled size.
@@ -797,15 +897,16 @@ fn build_texture(image: &Image, w: u32, h: u32) -> Option<Arc<sk::Pixmap>> {
                 // Resizing (rather than the final premultiply pass below) is
                 // the expensive part for a large placed image (e.g. a
                 // full-bleed poster/certificate background), so this uses
-                // `fast_image_resize`, which is SIMD-accelerated and (via its
-                // `rayon` feature) parallelizes the convolution across
-                // threads, instead of `image`'s single-threaded scalar
-                // resize.
-                let src = to_rgba8(image)?;
+                // SIMD-accelerated `fast_image_resize`. Its Rayon feature
+                // must remain disabled: during banded export, Rayon workers
+                // can all be waiting for these render threads to finish.
+                let src = raster.rgba8();
                 let mut dst = FirImage::new(w, h, PixelType::U8x4);
-                Resizer::new()
-                    .resize(src.as_ref(), &mut dst, &ResizeOptions::new().resize_alg(alg))
-                    .ok()?;
+                // See the matching comment in
+                // `try_blit_resized_axis_aligned` for `use_alpha`.
+                let opts =
+                    ResizeOptions::new().resize_alg(alg).use_alpha(raster.has_alpha());
+                Resizer::new().resize(src.as_ref(), &mut dst, &opts).ok()?;
 
                 let chunks = dst.buffer().chunks_exact(4);
                 for (src, dest) in chunks.zip(texture.pixels_mut()) {
@@ -881,4 +982,81 @@ fn build_pdf_texture(pdf: &PdfImage, w: u32, h: u32) -> Option<sk::Pixmap> {
 
     let bytes: Vec<u8> = bytemuck::cast_vec(hayro_pix.take());
     sk::Pixmap::from_vec(bytes, IntSize::from_wh(w, h)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::ImageEncoder;
+    use typst_library::foundations::Bytes;
+    use typst_library::visualize::ExchangeFormat;
+
+    fn solid_png(alpha: bool) -> Image {
+        let mut data = Vec::new();
+        let pixel = if alpha { &[120, 80, 40, 128][..] } else { &[120, 80, 40][..] };
+        image::codecs::png::PngEncoder::new(&mut data)
+            .write_image(
+                &pixel.repeat(32 * 32),
+                32,
+                32,
+                if alpha {
+                    image::ExtendedColorType::Rgba8
+                } else {
+                    image::ExtendedColorType::Rgb8
+                },
+            )
+            .unwrap();
+        Image::plain(RasterImage::plain(Bytes::new(data), ExchangeFormat::Png).unwrap())
+    }
+
+    #[test]
+    fn resized_masked_png_matches_unmasked_composite() {
+        for alpha in [false, true] {
+            for dimension in [16, 64] {
+                let image = solid_png(alpha);
+                let mut mask = sk::Mask::new(dimension, dimension).unwrap();
+                mask.data_mut().fill(255);
+                let state = State { mask: Some(&mask), ..State::default() };
+                let mut masked = sk::Pixmap::new(dimension, dimension).unwrap();
+                let mut reference = masked.clone();
+                masked.fill(sk::Color::WHITE);
+                reference.fill(sk::Color::WHITE);
+                try_blit_resized_axis_aligned(
+                    &mut masked.as_mut(),
+                    &state,
+                    &image,
+                    dimension as f32,
+                    dimension as f32,
+                )
+                .unwrap();
+                try_blit_resized_axis_aligned(
+                    &mut reference.as_mut(),
+                    &State::default(),
+                    &image,
+                    dimension as f32,
+                    dimension as f32,
+                )
+                .unwrap();
+                assert_eq!(masked.data(), reference.data());
+                let pixel = masked.pixel(0, 0).unwrap();
+                if !alpha {
+                    assert_eq!(
+                        (pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()),
+                        (120, 80, 40, 255)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_mul_matches_tiny_skia_rounding() {
+        for scale in [0, 1, 32, 127, 128, 200, 255] {
+            let color = 1 | (37 << 8) | (128 << 16) | (255 << 24);
+            let actual = alpha_mul(color, scale);
+            let expected =
+                [1_u32, 37, 128, 255].map(|value| ((value * scale + 255) >> 8) as u8);
+            assert_eq!(actual.to_le_bytes(), expected, "scale {scale}");
+        }
+    }
 }

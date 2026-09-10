@@ -25,6 +25,53 @@ fn test_compile_pdf() {
 }
 
 #[test]
+fn test_parallel_png_resize_completes() {
+    let project = tempfs();
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, 256, 256);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&vec![100; 256 * 256 * 3])
+            .unwrap();
+    }
+    project.write("image.png", encoded);
+    let source = project.write(
+        "resize.typ",
+        "#set page(width: 512pt, height: 512pt, margin: 0pt)\n\
+         #image(\"image.png\", width: 512pt)\n\
+         #pagebreak()\n\
+         #image(\"image.png\", width: 512pt)",
+    );
+    let output = source.with_file_name("page-{p}.png");
+    let mut child = exec()
+        .arg("compile")
+        .arg(source)
+        .arg(output)
+        .args(["--ppi", "72", "-j", "2", "--render-threads", "2"])
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "PNG export failed: {status}");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("parallel PNG export did not finish within 30 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    project.read("page-1.png").must_start_with(b"\x89PNG\r\n\x1a\n");
+    project.read("page-2.png").must_start_with(b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
 fn test_compile_pdf_version() {
     let project = tempfs();
     let output = exec().arg("--version").must_succeed();

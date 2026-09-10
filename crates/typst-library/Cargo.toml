@@ -25,6 +25,7 @@ bumpalo = { workspace = true }
 ciborium = { workspace = true }
 codex = { workspace = true }
 comemo = { workspace = true }
+crc32fast = { workspace = true }
 csv = { workspace = true }
 ecow = { workspace = true }
 either = { workspace = true }

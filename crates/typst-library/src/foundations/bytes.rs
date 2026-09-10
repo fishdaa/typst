@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
-use std::ops::{Add, AddAssign, Deref};
+use std::ops::{Add, AddAssign, Deref, Range};
 use std::str::Utf8Error;
 use std::sync::Arc;
 
@@ -74,6 +74,39 @@ impl Bytes {
         T: AsRef<str> + Send + Sync + 'static,
     {
         Self(Arc::new(LazyHash::new(StrWrapper(data))))
+    }
+
+    /// Create `Bytes` from a byte source that can release an
+    /// already-consumed prefix back to the operating system (see [`Paged`]).
+    ///
+    /// The only difference from [`Bytes::new`] is that
+    /// [`Bytes::release`] becomes effective rather than a no-op.
+    pub fn from_paged<T>(data: T) -> Self
+    where
+        T: Paged,
+    {
+        Self(Arc::new(LazyHash::new(PagedWrapper(data))))
+    }
+
+    /// Hints that `range` has been consumed and is unlikely to be read
+    /// again, so the backing storage may release it.
+    ///
+    /// This is a no-op unless the bytes were created via
+    /// [`Bytes::from_paged`]. It never invalidates any byte: a released byte
+    /// is transparently restored (at the cost of a page fault) if it is read
+    /// again, so this is purely an optimization and is always safe to call.
+    ///
+    /// A sequential reader of a large memory-mapped asset (e.g. the PNG
+    /// decoder walking a poster background) uses this to keep resident
+    /// memory proportional to its own read window rather than to the whole
+    /// file, which otherwise dominates peak memory for large assets.
+    ///
+    /// Deliberately takes a range rather than a "everything before here"
+    /// high-water mark: the same bytes are walked more than once (hashed,
+    /// validated, then decoded), and each pass has to be able to release
+    /// what it re-read, not just what no pass has ever reached.
+    pub fn release(&self, range: Range<usize>) {
+        self.inner().release(range);
     }
 
     /// Return `true` if the length is 0.
@@ -217,6 +250,18 @@ impl Bytes {
         (inner as &mut dyn Any)
             .downcast_mut::<StrWrapper<T>>()
             .map(|wrapper| &mut wrapper.0)
+    }
+
+    /// Try to access a source this was built from via
+    /// [`Bytes::from_paged`].
+    #[cfg(test)]
+    fn to_underlying_paged<T>(&self) -> Option<&T>
+    where
+        T: Paged,
+    {
+        (self.inner() as &dyn Any)
+            .downcast_ref::<PagedWrapper<T>>()
+            .map(|wrapper| &wrapper.0)
     }
 
     /// Access the inner `dyn Bytelike`.
@@ -383,6 +428,44 @@ pub struct IntoStringError {
 trait Bytelike: Any + Send + Sync {
     fn as_bytes(&self) -> &[u8];
     fn as_str(&self) -> Result<&str, Utf8Error>;
+
+    /// See [`Bytes::release`]. Defaults to doing nothing, which is always a
+    /// valid implementation.
+    fn release(&self, _range: Range<usize>) {}
+
+    /// Feeds the bytes to a hasher.
+    ///
+    /// Overridable so that a source which can release consumed pages does so
+    /// while being hashed: hashing necessarily touches every byte, and for a
+    /// large memory-mapped asset that would otherwise pull the whole file
+    /// into memory before anything has even looked at the image.
+    fn hash_bytes(&self, state: &mut dyn Hasher) {
+        self.as_bytes().hash(&mut HasherRef(state));
+    }
+}
+
+/// Lets a `&mut dyn Hasher` be used where a `H: Hasher` is required, so that
+/// [`Bytelike::hash_bytes`] can stay object-safe (and thus overridable) while
+/// still delegating to ordinary `Hash` implementations.
+struct HasherRef<'a>(&'a mut dyn Hasher);
+
+impl Hasher for HasherRef<'_> {
+    fn finish(&self) -> u64 {
+        self.0.finish()
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    // Keep the stable-hash behavior of the wrapped hasher. In particular,
+    // `hash128` hashes `usize` as `u64` so its output is identical on 32-bit
+    // and 64-bit targets. Using the default `Hasher::write_usize` here would
+    // write only four bytes on 32-bit targets and would make paged bytes hash
+    // differently from ordinary bytes.
+    fn write_usize(&mut self, value: usize) {
+        self.0.write_usize(value);
+    }
 }
 
 impl<T> Bytelike for T
@@ -400,7 +483,73 @@ where
 
 impl Hash for dyn Bytelike {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_bytes().hash(state);
+        self.hash_bytes(state);
+    }
+}
+
+/// A byte source that can release an already-consumed prefix back to the
+/// operating system, e.g. a memory-mapped file, which can drop clean
+/// file-backed pages and re-fault them on demand.
+///
+/// Implement this (and construct via [`Bytes::from_paged`]) to make
+/// [`Bytes::release`] effective for a source; every other source keeps
+/// the default no-op.
+pub trait Paged: Any + Send + Sync {
+    /// A view of the whole byte range.
+    fn as_bytes(&self) -> &[u8];
+
+    /// Release `range`, if the backing storage can. Must keep every byte
+    /// *readable* -- see [`Bytes::release`].
+    ///
+    /// Implementations should be cheap enough to call repeatedly and must
+    /// tolerate overlapping, repeated, or out-of-order ranges; callers batch
+    /// their calls, so this does not need to be free.
+    fn release(&self, range: Range<usize>);
+}
+
+/// Makes [`Paged`] objects usable with `Bytes`.
+struct PagedWrapper<T>(T);
+
+impl<T> Bytelike for PagedWrapper<T>
+where
+    T: Paged,
+{
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    fn as_str(&self) -> Result<&str, Utf8Error> {
+        std::str::from_utf8(self.0.as_bytes())
+    }
+
+    fn release(&self, range: Range<usize>) {
+        self.0.release(range);
+    }
+
+    /// Hashes in chunks, releasing each one afterwards.
+    ///
+    /// A `Hasher` consumes bytes as a stream, so feeding it a chunk at a time
+    /// produces exactly the same hash as feeding it the whole slice at once
+    /// -- this only changes how much of the source has to be resident while
+    /// the hash is computed. That matters because hashing happens *before*
+    /// anything reads the image (it is how memoized loads are keyed), so
+    /// without this the peak would include the entire asset no matter how
+    /// carefully everything downstream streams it.
+    fn hash_bytes(&self, state: &mut dyn Hasher) {
+        /// Large enough that the per-chunk overhead is irrelevant, small
+        /// enough to keep the resident window negligible.
+        const CHUNK: usize = 1024 * 1024;
+
+        let bytes = self.0.as_bytes();
+        // Mirrors the length prefix `<[u8] as Hash>::hash` writes before the
+        // data itself (its `write_length_prefix` is still unstable, but its
+        // default implementation is exactly this), so that a paged source
+        // and a plain one hash identically.
+        bytes.len().hash(&mut HasherRef(state));
+        for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
+            state.write(chunk);
+            self.0.release(index * CHUNK..index * CHUNK + chunk.len());
+        }
     }
 }
 
@@ -455,7 +604,79 @@ fn out_of_bounds_no_default(index: i64, len: usize) -> EcoString {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use typst_utils::hash128;
+
     use super::*;
+
+    /// A [`Paged`] source over a plain vector, recording what it was asked
+    /// to release.
+    struct FakePaged {
+        data: Vec<u8>,
+        released: AtomicUsize,
+    }
+
+    impl Paged for FakePaged {
+        fn as_bytes(&self) -> &[u8] {
+            &self.data
+        }
+
+        fn release(&self, range: Range<usize>) {
+            self.released.fetch_add(range.len(), Ordering::Relaxed);
+        }
+    }
+
+    /// Hashing must not depend on how the bytes are backed: the chunked,
+    /// page-releasing hash of a paged source has to match the plain one, or
+    /// the two would key memoized loads differently.
+    #[test]
+    fn test_paged_and_plain_bytes_hash_identically() {
+        for len in [0, 1, 1000, 1024 * 1024, 1024 * 1024 + 7, 3 * 1024 * 1024] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let plain = Bytes::new(data.clone());
+            let paged = Bytes::from_paged(FakePaged {
+                data: data.clone(),
+                released: AtomicUsize::new(0),
+            });
+            assert_eq!(plain.as_slice(), paged.as_slice(), "len {len}");
+            assert_eq!(hash128(&plain), hash128(&paged), "len {len}");
+        }
+    }
+
+    /// Hashing a paged source must release the pages it walks over -- it is
+    /// the first thing that touches every byte of a loaded asset, so a hash
+    /// that doesn't release leaves the whole file resident regardless of how
+    /// carefully everything downstream streams it.
+    #[test]
+    fn test_hashing_releases_paged_bytes() {
+        let len = 3 * 1024 * 1024 + 5;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let paged = Bytes::from_paged(FakePaged { data, released: AtomicUsize::new(0) });
+        let released = || {
+            paged
+                .to_underlying_paged::<FakePaged>()
+                .expect("paged source")
+                .released
+                .load(Ordering::Relaxed)
+        };
+
+        let _ = hash128(&paged);
+        assert!(released() >= len, "only released {} of {len} bytes", released());
+
+        // Releasing must not be a one-shot high-water mark: bytes that get
+        // re-read (a later pass over the same asset) have to be releasable
+        // again, or the second pass leaves the whole file resident.
+        let first = released();
+        paged.release(0..len);
+        assert!(
+            released() >= first + len,
+            "re-releasing the same range must count again"
+        );
+
+        // Every other source simply ignores the hint.
+        Bytes::new(vec![1, 2, 3]).release(0..2);
+    }
 
     /// Round-tripping with lone ownership should retain the same string.
     #[test]

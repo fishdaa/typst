@@ -12,7 +12,7 @@ use crate::paint::{self, GradientSampler, PaintSampler, TilingSampler};
 use crate::{AbsExt, State, shape};
 
 /// Render a text run into the canvas.
-pub fn render_text(canvas: &mut sk::Pixmap, state: State, text: &TextItem) {
+pub fn render_text(canvas: &mut sk::PixmapMut, state: State, text: &TextItem) {
     let mut x = Abs::zero();
     let mut y = Abs::zero();
     for glyph in &text.glyphs {
@@ -42,7 +42,7 @@ pub fn render_text(canvas: &mut sk::Pixmap, state: State, text: &TextItem) {
 
 /// Render an outline glyph into the canvas. This is the "normal" case.
 fn render_outline_glyph(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     state: State,
     text: &TextItem,
     id: GlyphId,
@@ -164,7 +164,7 @@ fn render_outline_glyph(
 }
 
 fn write_bitmap<S: PaintSampler>(
-    canvas: &mut sk::Pixmap,
+    canvas: &mut sk::PixmapMut,
     bitmap: &Bitmap,
     x_int: i32,
     y_int: i32,

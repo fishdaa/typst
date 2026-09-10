@@ -377,8 +377,38 @@ pub struct CompileArgs {
     /// (more, smaller bands; more frequent disk syncs) for a smaller memory
     /// footprint. Unset uses a fixed built-in budget tuned for typical
     /// documents.
+    ///
+    /// Source assets are not part of this budget, but they no longer need to
+    /// be: a memory-mapped image is released back to the operating system as
+    /// the decoder consumes it, so a large background PNG does not stay
+    /// resident for the whole export. What remains outside the budget is the
+    /// document model, fonts, and process overhead -- tens of mebibytes for
+    /// a typical page -- so leave headroom between this value and a
+    /// container's real limit.
     #[arg(long = "max-memory", value_name = "MEBIBYTES")]
     pub max_memory: Option<u64>,
+
+    /// How many threads to use to render a single page to PNG.
+    ///
+    /// Each horizontal band of the page (see `--max-memory`) is split into
+    /// this many row tiles rendered in parallel, while a further thread
+    /// compresses the previous band -- so rendering and PNG encoding overlap
+    /// instead of alternating. Tiles write directly into disjoint rows of the
+    /// band's own buffer, so the cost is a fixed couple of extra band-sized
+    /// buffers rather than one per thread.
+    ///
+    /// This helps most when a large image has to be resampled, where the
+    /// resampling is the bulk of the work and parallelizes well. It helps
+    /// least when the image is drawn at its native resolution, because that
+    /// work is mostly PNG decoding, which has to stay sequential.
+    ///
+    /// A value of 1 renders and encodes strictly alternately in one thread.
+    /// Defaults to the number of available cores, capped at 4, above which
+    /// PNG compression -- which cannot be parallelized at this compression
+    /// level -- becomes the limit. Note that `--jobs` separately controls how
+    /// many *pages* are exported at once.
+    #[arg(long = "render-threads", value_name = "COUNT")]
+    pub render_threads: Option<usize>,
 
     /// File path to which a Makefile with the current compilation's
     /// dependencies will be written.

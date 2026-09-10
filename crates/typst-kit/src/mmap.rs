@@ -3,9 +3,10 @@
 
 use std::fs::{self, File};
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 
-use typst_library::foundations::Bytes;
+use typst_library::foundations::{Bytes, Paged};
 
 /// Below this size, a file is just read into a `Vec<u8>` via [`fs::read`].
 /// `mmap`'s fixed costs (a syscall, page table setup) aren't worth it for
@@ -47,18 +48,84 @@ pub fn read_file(path: &Path) -> io::Result<Bytes> {
     // SAFETY: See this function's doc comment for the accepted risk if
     // `file` is mutated in place while mapped.
     match unsafe { memmap2::Mmap::map(&file) } {
-        Ok(mmap) => Ok(Bytes::new(MappedFile(mmap))),
+        Ok(mmap) => {
+            // Large assets are read front-to-back exactly once (a PNG's
+            // pixel data can only be decompressed sequentially), so tell the
+            // kernel to read ahead aggressively and drop pages behind the
+            // read position on its own. Best-effort: an error here only
+            // costs performance.
+            #[cfg(unix)]
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+            Ok(Bytes::from_paged(MappedFile { mmap }))
+        }
         Err(_) => fs::read(path).map(Bytes::new),
     }
 }
 
 /// A memory-mapped file, usable as a [`Bytes`] backing.
-struct MappedFile(memmap2::Mmap);
+struct MappedFile {
+    mmap: memmap2::Mmap,
+}
 
-impl AsRef<[u8]> for MappedFile {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
+impl Paged for MappedFile {
+    fn as_bytes(&self) -> &[u8] {
+        &self.mmap
     }
+
+    /// Releases whole pages of `range` with `MADV_DONTNEED`.
+    ///
+    /// The mapping is a read-only private file mapping, so its pages are
+    /// always clean: dropping them needs no writeback and loses nothing --
+    /// a later read of the same range simply faults it back in from the
+    /// file. This is what keeps a large asset (e.g. an 80 MiB poster
+    /// background PNG) from staying fully resident for the whole export
+    /// just because something read it from start to finish; a
+    /// memory-constrained cgroup charges those clean pages the same as heap
+    /// memory.
+    ///
+    /// Stateless, so a range that a previous pass already released can be
+    /// released again after a later pass faulted it back in.
+    fn release(&self, range: Range<usize>) {
+        #[cfg(not(unix))]
+        let _ = range;
+
+        #[cfg(unix)]
+        {
+            // Round the start up and the end down: a partially-consumed page at
+            // either edge is likely still in use by the caller.
+            let page = page_size();
+            let start = range.start.next_multiple_of(page);
+            let end = range.end.min(self.mmap.len()) & !(page - 1);
+            if end <= start {
+                return;
+            }
+
+            // SAFETY: `MADV_DONTNEED` is only unsafe for a mapping that can
+            // hold un-written-back data. This is a read-only private mapping of
+            // a file, so every page is clean and re-readable from the file, and
+            // `memmap2` hands out only shared references to it.
+            let _ = unsafe {
+                self.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    start,
+                    end - start,
+                )
+            };
+        }
+    }
+}
+
+/// The system page size, which `advise_range` requires offsets to be aligned
+/// to. Falls back to 4 KiB, the near-universal value, if the query fails.
+#[cfg(unix)]
+fn page_size() -> usize {
+    // SAFETY: `sysconf` is always safe to call; it only reads a system
+    // parameter.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 {
+        return size as usize;
+    }
+    4096
 }
 
 #[cfg(test)]

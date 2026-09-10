@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::sync::atomic::{self, AtomicU32};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::diag::{StrResult, bail};
@@ -40,6 +42,8 @@ struct RasterImageInner {
     /// of the image (see [`RasterImage::decode_rgba_row_range`]) never pays
     /// for the full decode.
     dynamic: OnceLock<Arc<DynamicImage>>,
+    /// Shared RGBA8 conversion for renderers that cannot stream source rows.
+    rgba8: OnceLock<Arc<DynamicImage>>,
     exif_rotation: Option<u32>,
     icc: Option<Bytes>,
     dpi: Option<f64>,
@@ -52,23 +56,156 @@ struct RasterImageInner {
     /// a later row -- making a full band-by-band render of an image
     /// `O(bands * height)` instead of `O(height)`.
     row_cursor: Mutex<Option<RowCursor>>,
+    /// A floor, in rows, on how much of the decoded tail `row_cursor` keeps
+    /// behind itself. Raised through [`RasterImage::reserve_retained_rows`]
+    /// by a caller that is about to make row-range requests out of order.
+    retain_rows: AtomicU32,
+    /// How many times a decoder has been opened for `row_cursor`. Since a
+    /// PNG can only be decompressed from the start, each start past the
+    /// first re-does all the work up to the requested row -- so this is the
+    /// signal that row-range requests are defeating the cursor. Exposed via
+    /// [`RasterImage::decoder_starts`] so that can be asserted against.
+    decoder_starts: AtomicU32,
 }
 
-/// A `png` reader paused after decoding up to (but not including) `next_row`.
+/// A [`std::io::Read`] adapter over [`Bytes`] that releases the pages it has
+/// already consumed (see [`Bytes::release`]).
+///
+/// A PNG's pixel data can only be decompressed front-to-back, so a decoder
+/// walks the file exactly once, in order. Without this, decoding a large
+/// memory-mapped asset leaves the entire file resident for the rest of the
+/// export -- which, for a poster-sized background, dominates peak memory
+/// however carefully the render path bounds its own buffers, because a
+/// memory-constrained cgroup charges those clean pages just like heap
+/// memory.
+struct PagedSource {
+    data: Bytes,
+    pos: usize,
+    /// How far this reader has already released, so each pass over the same
+    /// bytes releases what *it* read rather than relying on some earlier
+    /// pass having done so.
+    released: usize,
+}
+
+/// How far behind the read position [`PagedSource`] keeps resident. The `png`
+/// crate copies out of `read`'s buffer rather than retaining it, so this is
+/// only a safety margin.
+const KEEP_RESIDENT_BEHIND: usize = 64 * 1024;
+
+/// How much [`PagedSource`] lets accumulate before releasing it, so a
+/// decoder reading a few kilobytes at a time doesn't pay a syscall per read.
+const RELEASE_CHUNK: usize = 4 * 1024 * 1024;
+
+impl PagedSource {
+    fn new(data: Bytes) -> Self {
+        Self { data, pos: 0, released: 0 }
+    }
+
+    /// Advances the read position, releasing what is now well behind it.
+    fn advance(&mut self, amount: usize) {
+        self.pos = (self.pos + amount).min(self.data.len());
+
+        let target = self.pos.saturating_sub(KEEP_RESIDENT_BEHIND);
+        if target >= self.released + RELEASE_CHUNK {
+            self.data.release(self.released..target);
+            self.released = target;
+        }
+    }
+}
+
+impl io::Read for PagedSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let slice = &self.data.as_slice()[self.pos..];
+        let n = slice.len().min(buf.len());
+        buf[..n].copy_from_slice(&slice[..n]);
+        self.advance(n);
+        Ok(n)
+    }
+}
+
+impl io::BufRead for PagedSource {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        Ok(&self.data.as_slice()[self.pos..])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.advance(amount);
+    }
+}
+
+impl io::Seek for PagedSource {
+    /// Seeking backwards is allowed and always correct: a released page is
+    /// transparently faulted back in (see [`Bytes::release`]), it just
+    /// costs a fault. The decoder only seeks within the header region in
+    /// practice.
+    fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {
+        let len = self.data.len() as i64;
+        let target = match from {
+            io::SeekFrom::Start(offset) => offset as i64,
+            io::SeekFrom::End(offset) => len + offset,
+            io::SeekFrom::Current(offset) => self.pos as i64 + offset,
+        };
+        if target < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot seek before the start of the data",
+            ));
+        }
+        self.pos = (target as usize).min(self.data.len());
+        // Anything after the new position may be read again, so allow it to
+        // be released again too.
+        self.released = self.released.min(self.pos);
+        Ok(self.pos as u64)
+    }
+}
+
+/// Bounds on [`RowCursor::retained`]: enough rows to absorb a resize
+/// filter's kernel support at any realistic scale factor, while never
+/// holding a meaningful fraction of a large image.
+const RETAIN_MAX_ROWS: usize = 128;
+const RETAIN_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The ceiling on a window requested through
+/// [`RasterImage::reserve_retained_rows`], which asks for more than the
+/// default bounds above. That request is derived from a band's height, which
+/// a caller already sizes to its memory budget, so this only guards against
+/// a nonsensical value.
+const RETAIN_RESERVED_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// A `png` reader paused after decoding up to (but not including)
+/// `next_row`, plus a bounded tail of the rows it already handed out.
 struct RowCursor {
-    reader: png::Reader<io::Cursor<Bytes>>,
+    reader: png::Reader<PagedSource>,
     next_row: u32,
     width: u32,
     channels: u8,
     /// Bytes per channel sample in the *source* row data `next_row()`
-    /// hands back (1 for 8-bit, 2 for 16-bit). The decoded output is
-    /// always tightly packed RGBA8 regardless of this value.
+    /// hands back (1 for 8-bit, 2 for 16-bit). Decoded output is tightly
+    /// packed 8-bit channels regardless of this value.
     bytes_per_sample: u8,
+    /// Raw (unconverted) source rows that were already decoded, oldest
+    /// first, so a request starting slightly *before* `next_row` can be
+    /// served without restarting decompression from row 0.
+    ///
+    /// The resampling render path asks for *overlapping* row ranges: it
+    /// expands each band by the resize filter's kernel support on both
+    /// sides, so band N+1 begins a few rows above where band N stopped.
+    /// Since PNG rows are filtered against their predecessor there is no way
+    /// to seek backwards, so without this tail that small overlap forced a
+    /// full restart, making a banded export of one image cost
+    /// `O(bands * height)` row decodes instead of `O(height)`.
+    retained: VecDeque<Vec<u8>>,
+    /// The row index of `retained.front()`. Maintained so that
+    /// `retained_from + retained.len() == next_row`.
+    retained_from: u32,
+    /// A spare row buffer, recycled between `next_row()` calls so that
+    /// retaining rows doesn't allocate per row.
+    spare: Vec<u8>,
 }
 
 impl RowCursor {
     /// Opens a fresh reader positioned at row 0. Returns `None` for anything
-    /// [`RasterImage::decode_rgba_row_range`] doesn't support.
+    /// [`RasterImage::decode_row_range`] doesn't support.
     fn new(data: &Bytes) -> Option<Self> {
         let reader = png_reader(data.clone()).ok()?;
         let width = {
@@ -80,8 +217,12 @@ impl RowCursor {
         };
         let (color_type, bit_depth) = reader.output_color_type();
         let (bytes_per_sample, channels) = match (bit_depth, color_type) {
+            (png::BitDepth::Eight, png::ColorType::Grayscale) => (1, 1),
+            (png::BitDepth::Eight, png::ColorType::GrayscaleAlpha) => (1, 2),
             (png::BitDepth::Eight, png::ColorType::Rgb) => (1, 3),
             (png::BitDepth::Eight, png::ColorType::Rgba) => (1, 4),
+            (png::BitDepth::Sixteen, png::ColorType::Grayscale) => (2, 1),
+            (png::BitDepth::Sixteen, png::ColorType::GrayscaleAlpha) => (2, 2),
             (png::BitDepth::Sixteen, png::ColorType::Rgb) => (2, 3),
             (png::BitDepth::Sixteen, png::ColorType::Rgba) => (2, 4),
             _ => return None,
@@ -92,7 +233,158 @@ impl RowCursor {
             width,
             channels,
             bytes_per_sample,
+            retained: VecDeque::new(),
+            retained_from: 0,
+            spare: Vec::new(),
         })
+    }
+
+    /// Adds a just-decoded row to the retained tail, returning a buffer that
+    /// is free for reuse (the evicted row, or a fresh empty one).
+    ///
+    /// `reserved` is a floor on the window size requested through
+    /// [`RasterImage::reserve_retained_rows`]; the default bounds apply when
+    /// it is zero.
+    fn push_retained(&mut self, row: Vec<u8>, reserved: u32) -> Vec<u8> {
+        let row_len = row.len().max(1);
+        let default_rows = RETAIN_MAX_ROWS.min((RETAIN_MAX_BYTES / row_len).max(1));
+        let reserved_rows =
+            (reserved as usize).min((RETAIN_RESERVED_MAX_BYTES / row_len).max(1));
+        let max_rows = default_rows.max(reserved_rows);
+        self.retained.push_back(row);
+        if self.retained.len() > max_rows {
+            self.retained_from += 1;
+            self.retained.pop_front().unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Visits rows `[y0, y1)` as tightly packed `out_channels`-channel rows,
+    /// serving what the retained tail still holds and decoding the rest.
+    ///
+    /// The caller must have checked that `y0 >= self.retained_from`.
+    fn visit(
+        &mut self,
+        y0: u32,
+        y1: u32,
+        out_channels: u8,
+        reserved: u32,
+        f: &mut dyn FnMut(u32, &[u8]),
+    ) -> Option<()> {
+        let mut scratch = vec![0_u8; self.width as usize * out_channels as usize];
+
+        // Rows that were already decoded and are still retained.
+        for y in y0..y1.min(self.next_row) {
+            let row = self.retained.get((y - self.retained_from) as usize)?;
+            convert_row(
+                row,
+                &mut scratch,
+                self.bytes_per_sample,
+                self.channels,
+                out_channels,
+            );
+            f(y, &scratch);
+        }
+
+        // Decode forward, retaining each row on the way past. The row is
+        // copied out of the decoder before being retained, because holding
+        // the decoder's borrow would conflict with mutating `self`.
+        while self.next_row < y1 {
+            let mut buf = std::mem::take(&mut self.spare);
+            buf.clear();
+            match self.reader.next_row() {
+                Ok(Some(row)) => buf.extend_from_slice(row.data()),
+                Ok(None) => {
+                    self.spare = buf;
+                    break;
+                }
+                Err(_) => {
+                    self.spare = buf;
+                    return None;
+                }
+            }
+
+            let y = self.next_row;
+            if y >= y0 {
+                convert_row(
+                    &buf,
+                    &mut scratch,
+                    self.bytes_per_sample,
+                    self.channels,
+                    out_channels,
+                );
+                f(y, &scratch);
+            }
+            self.next_row += 1;
+            self.spare = self.push_retained(buf, reserved);
+        }
+
+        Some(())
+    }
+}
+
+/// Converts one raw PNG row into `dst`, tightly packed with `out_channels`
+/// 8-bit channels. Grayscale samples are replicated into RGB; sources
+/// without alpha get a fully opaque alpha in a 4-channel destination.
+fn convert_row(
+    src: &[u8],
+    dst: &mut [u8],
+    bytes_per_sample: u8,
+    channels: u8,
+    out_channels: u8,
+) {
+    match (bytes_per_sample, channels, out_channels) {
+        (1 | 2, 1 | 2, 3 | 4) => {
+            let sample_bytes = bytes_per_sample as usize;
+            for (s, d) in src
+                .chunks_exact(channels as usize * sample_bytes)
+                .zip(dst.chunks_exact_mut(out_channels as usize))
+            {
+                let sample = |offset| {
+                    if sample_bytes == 1 {
+                        s[offset]
+                    } else {
+                        sample16_to_8(s[offset], s[offset + 1])
+                    }
+                };
+                d[..3].fill(sample(0));
+                if out_channels == 4 {
+                    d[3] = if channels == 2 { sample(sample_bytes) } else { 255 };
+                }
+            }
+        }
+        // Already exactly the destination layout.
+        (1, 4, 4) | (1, 3, 3) => dst.copy_from_slice(&src[..dst.len()]),
+        (1, 3, 4) => {
+            for (s, d) in src.chunks_exact(3).zip(dst.chunks_exact_mut(4)) {
+                d[..3].copy_from_slice(s);
+                d[3] = 255;
+            }
+        }
+        (2, 4, 4) => {
+            for (s, d) in src.chunks_exact(8).zip(dst.chunks_exact_mut(4)) {
+                for i in 0..4 {
+                    d[i] = sample16_to_8(s[i * 2], s[i * 2 + 1]);
+                }
+            }
+        }
+        (2, 3, 4) => {
+            for (s, d) in src.chunks_exact(6).zip(dst.chunks_exact_mut(4)) {
+                for i in 0..3 {
+                    d[i] = sample16_to_8(s[i * 2], s[i * 2 + 1]);
+                }
+                d[3] = 255;
+            }
+        }
+        (2, 3, 3) => {
+            for (s, d) in src.chunks_exact(6).zip(dst.chunks_exact_mut(3)) {
+                for i in 0..3 {
+                    d[i] = sample16_to_8(s[i * 2], s[i * 2 + 1]);
+                }
+            }
+        }
+        _ => unreachable!("unsupported channel conversion"),
     }
 }
 
@@ -134,8 +426,15 @@ impl RasterImage {
                     let (raw_w, raw_h, has_alpha, icc, is_8bit) =
                         validate_png(&data, icc)?;
 
+                    // Read through `PagedSource` rather than a plain
+                    // cursor: finding out that a PNG carries no EXIF at all
+                    // means walking its chunks to the end, and doing that
+                    // over a plain cursor pulls the entire file into memory
+                    // -- which for a large asset is the single biggest
+                    // contribution to peak memory, dwarfing everything the
+                    // render path is careful about.
                     let exif = exif::Reader::new()
-                        .read_from_container(&mut io::Cursor::new(&data))
+                        .read_from_container(&mut PagedSource::new(data.clone()))
                         .ok();
 
                     let (mut width, mut height) = (raw_w, raw_h);
@@ -274,10 +573,13 @@ impl RasterImage {
             has_alpha,
             png_is_8bit,
             dynamic: dynamic_cell,
+            rgba8: OnceLock::new(),
             exif_rotation: exif_rot,
             icc,
             dpi,
             row_cursor: Mutex::new(None),
+            retain_rows: AtomicU32::new(0),
+            decoder_starts: AtomicU32::new(0),
         })))
     }
 
@@ -382,6 +684,42 @@ impl RasterImage {
         self.decode_dynamic()
     }
 
+    /// Access the fully decoded image with RGBA8 pixels.
+    ///
+    /// Concurrent render tiles share one conversion. Memoizing the conversion
+    /// alone can still compute it concurrently on a cache miss, temporarily
+    /// allocating a full image per tile. The once cell also shares an existing
+    /// RGBA8 dynamic image without copying its pixels.
+    pub fn rgba8(&self) -> &Arc<DynamicImage> {
+        self.0.rgba8.get_or_init(|| {
+            let dynamic = self.dynamic();
+            if dynamic.as_rgba8().is_some() {
+                dynamic.clone()
+            } else {
+                Arc::new(DynamicImage::ImageRgba8(dynamic.to_rgba8()))
+            }
+        })
+    }
+
+    /// Whether the source uses grayscale samples, without decoding PNG pixels.
+    pub fn is_grayscale(&self) -> bool {
+        if matches!(self.0.format, RasterFormat::Exchange(ExchangeFormat::Png)) {
+            return png_reader(self.0.data.clone()).is_ok_and(|reader| {
+                matches!(
+                    reader.output_color_type().0,
+                    png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha
+                )
+            });
+        }
+        matches!(
+            self.dynamic().color(),
+            image::ColorType::L8
+                | image::ColorType::La8
+                | image::ColorType::L16
+                | image::ColorType::La16
+        )
+    }
+
     /// Access the ICC profile, if any.
     pub fn icc(&self) -> Option<&Bytes> {
         self.0.icc.as_ref()
@@ -392,9 +730,20 @@ impl RasterImage {
     /// materializing the whole decoded image.
     ///
     /// Returns `None` if the image doesn't qualify for this fast path --
-    /// only non-interlaced 8-bit- or 16-bit-per-channel RGB/RGBA PNGs with
+    /// only non-interlaced PNGs with RGB or grayscale samples and
     /// no EXIF-driven rotation do. Callers should fall back to
     /// [`Self::dynamic`] in that case.
+    pub fn decode_rgba_row_range(&self, y0: u32, y1: u32) -> Option<Vec<u8>> {
+        self.decode_row_range(y0, y1, 4)
+    }
+
+    /// Like [`Self::decode_rgba_row_range`], but with a caller-chosen
+    /// channel count: 4 for RGBA8, or 3 for RGB8.
+    ///
+    /// Asking for 3 channels is only honored for a source that has no alpha
+    /// channel of its own (otherwise dropping it would silently change the
+    /// pixels), and lets a consumer that doesn't need alpha -- e.g. resizing
+    /// an opaque background -- hold 25% less memory per buffer.
     ///
     /// This is meant for band-aware rendering of a large raster image
     /// (e.g. a full-bleed poster background): decoding rows before `y0`
@@ -402,94 +751,90 @@ impl RasterImage {
     /// decompression from the start of the image), but they're discarded
     /// immediately rather than retained, so memory stays bounded to the
     /// requested row range rather than the whole image.
-    pub fn decode_rgba_row_range(&self, y0: u32, y1: u32) -> Option<Vec<u8>> {
+    pub fn decode_row_range(&self, y0: u32, y1: u32, channels: u8) -> Option<Vec<u8>> {
+        let y1 = y1.min(self.0.height);
+        let stride = self.0.width as usize * channels as usize;
+        let rows = y1.saturating_sub(y0) as usize;
+        let mut out = vec![0_u8; rows * stride];
+        self.visit_rows(y0, y1, channels, |y, row| {
+            let offset = (y - y0) as usize * stride;
+            out[offset..offset + stride].copy_from_slice(row);
+        })?;
+        Some(out)
+    }
+
+    /// Opens a decoder positioned at row 0, counting the start.
+    fn start_cursor(&self) -> Option<RowCursor> {
+        self.0.decoder_starts.fetch_add(1, atomic::Ordering::Relaxed);
+        RowCursor::new(&self.0.data)
+    }
+
+    /// How many times a PNG decoder has been opened to serve row-range
+    /// requests for this image.
+    ///
+    /// One is the ideal: a decoder can only move forwards, so every
+    /// additional start re-decompresses the image from row 0 up to whatever
+    /// row was asked for. Consumers that walk the image in order (banded
+    /// rendering) should never push this above one; it is exposed so tests
+    /// can assert that.
+    pub fn decoder_starts(&self) -> u32 {
+        self.0.decoder_starts.load(atomic::Ordering::Relaxed)
+    }
+
+    /// Asks the row cursor to keep at least `rows` already-decoded rows
+    /// behind itself, so that a later request for an earlier row is served
+    /// from memory instead of restarting decompression from row 0.
+    ///
+    /// Row-range requests are cheap only while they arrive in increasing
+    /// order, which holds naturally for a band-by-band render. The row tiles
+    /// of a single band, however, are rendered concurrently and so reach the
+    /// image in an arbitrary order: whichever tile arrives first pulls the
+    /// cursor down to its own rows, and every tile above it then asks for
+    /// rows the cursor has already passed. Reserving a window as tall as the
+    /// band's source rows makes that order irrelevant -- the rows are decoded
+    /// exactly once and handed out in whatever order the tiles ask for them.
+    ///
+    /// The floor only ever rises, and is capped (see
+    /// `RETAIN_RESERVED_MAX_BYTES`).
+    pub fn reserve_retained_rows(&self, rows: u32) {
+        self.0.retain_rows.fetch_max(rows, atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::decode_row_range`] can serve this image with the
+    /// given channel count, without decoding any pixels.
+    ///
+    /// Lets a caller size its buffers for the cheaper channel count up
+    /// front instead of discovering only afterwards that it has to fall back
+    /// to the fully decoded image.
+    pub fn supports_row_range(&self, channels: u8) -> bool {
         if self.0.exif_rotation.is_some() {
-            return None;
+            return false;
         }
         if !matches!(self.0.format, RasterFormat::Exchange(ExchangeFormat::Png)) {
-            return None;
+            return false;
+        }
+        if !matches!(channels, 3 | 4) {
+            return false;
         }
 
+        // Opens the decoder if it isn't open yet (reading only the header),
+        // and then leaves it exactly where it was -- in particular this must
+        // never rewind a cursor that is already positioned mid-image, since
+        // that would restart decompression from row 0.
         let mut guard = self.0.row_cursor.lock().unwrap();
-
-        // Reuse the decoder if it's already positioned at or before `y0`
-        // (the common case, since bands are rendered top-to-bottom).
-        // Otherwise -- first call, or a request that rewinds, e.g. the same
-        // image placed twice on a page -- start over from row 0.
         let cursor = match guard.take() {
-            Some(cursor) if cursor.next_row <= y0 => cursor,
-            _ => RowCursor::new(&self.0.data)?,
+            Some(cursor) => cursor,
+            None => match self.start_cursor() {
+                Some(cursor) => cursor,
+                None => return false,
+            },
         };
-        let RowCursor {
-            mut reader,
-            mut next_row,
-            width,
-            channels,
-            bytes_per_sample,
-        } = cursor;
 
-        let height = reader.info().height;
-        let y1 = y1.min(height);
-        if y0 >= y1 {
-            *guard = Some(RowCursor {
-                reader,
-                next_row,
-                width,
-                channels,
-                bytes_per_sample,
-            });
-            return Some(Vec::new());
-        }
-
-        let mut out = vec![0_u8; width as usize * (y1 - y0) as usize * 4];
-        while next_row < y1 {
-            let Some(data) = reader.next_row().ok()? else { break };
-            if next_row >= y0 {
-                let start = (next_row - y0) as usize * width as usize * 4;
-                let dest = &mut out[start..start + width as usize * 4];
-                match (bytes_per_sample, channels) {
-                    (1, 4) => dest.copy_from_slice(data.data()),
-                    (1, 3) => {
-                        for (src, dst) in
-                            data.data().chunks_exact(3).zip(dest.chunks_exact_mut(4))
-                        {
-                            dst[..3].copy_from_slice(src);
-                            dst[3] = 255;
-                        }
-                    }
-                    (2, 4) => {
-                        for (src, dst) in
-                            data.data().chunks_exact(8).zip(dest.chunks_exact_mut(4))
-                        {
-                            for i in 0..4 {
-                                dst[i] = sample16_to_8(src[i * 2], src[i * 2 + 1]);
-                            }
-                        }
-                    }
-                    (2, 3) => {
-                        for (src, dst) in
-                            data.data().chunks_exact(6).zip(dest.chunks_exact_mut(4))
-                        {
-                            for i in 0..3 {
-                                dst[i] = sample16_to_8(src[i * 2], src[i * 2 + 1]);
-                            }
-                            dst[3] = 255;
-                        }
-                    }
-                    _ => unreachable!("RowCursor::new only yields these combinations"),
-                }
-            }
-            next_row += 1;
-        }
-
-        *guard = Some(RowCursor {
-            reader,
-            next_row,
-            width,
-            channels,
-            bytes_per_sample,
-        });
-        Some(out)
+        // Three channels are only available for a source that has no alpha
+        // channel of its own.
+        let supported = channels == 4 || matches!(cursor.channels, 1 | 3);
+        *guard = Some(cursor);
+        supported
     }
 
     /// Visits source rows `[y0, y1)` one at a time as tightly packed RGBA8.
@@ -498,15 +843,57 @@ impl RasterImage {
     /// of retaining the complete decoded band. In particular, a native-size
     /// alpha background can be blended directly into the render canvas with
     /// only one source row resident.
-    pub fn for_each_rgba_row<F>(&self, y0: u32, y1: u32, mut f: F) -> Option<()>
+    pub fn for_each_rgba_row<F>(&self, y0: u32, y1: u32, f: F) -> Option<()>
     where
         F: FnMut(u32, &[u8]),
     {
-        for y in y0..y1 {
-            let row = self.decode_rgba_row_range(y, y + 1)?;
-            f(y, &row);
+        self.visit_rows(y0, y1.min(self.0.height), 4, f)
+    }
+
+    /// The shared implementation of [`Self::decode_row_range`] and
+    /// [`Self::for_each_rgba_row`]: holds the decoder's lock across the
+    /// whole range and converts one row at a time into a single reusable
+    /// buffer, so neither the lock nor an allocation is paid per row.
+    fn visit_rows<F>(&self, y0: u32, y1: u32, out_channels: u8, mut f: F) -> Option<()>
+    where
+        F: FnMut(u32, &[u8]),
+    {
+        if self.0.exif_rotation.is_some() {
+            return None;
         }
-        Some(())
+        if !matches!(self.0.format, RasterFormat::Exchange(ExchangeFormat::Png)) {
+            return None;
+        }
+        if !matches!(out_channels, 3 | 4) {
+            return None;
+        }
+
+        let mut guard = self.0.row_cursor.lock().unwrap();
+
+        // Reuse the decoder when it is positioned at or before `y0`, or when
+        // the rows in between are still in its retained tail (see
+        // `RowCursor::retained`). Otherwise -- the first call, or a rewind
+        // past the tail, e.g. the same image placed twice on one page --
+        // start over from row 0.
+        let mut cursor = match guard.take() {
+            Some(cursor) if y0 >= cursor.retained_from => cursor,
+            _ => self.start_cursor()?,
+        };
+
+        // Dropping a real alpha channel is not this function's call to make.
+        if out_channels == 3 && !matches!(cursor.channels, 1 | 3) {
+            *guard = Some(cursor);
+            return None;
+        }
+
+        let reserved = self.0.retain_rows.load(atomic::Ordering::Relaxed);
+        let result = if y0 < y1 {
+            cursor.visit(y0, y1, out_channels, reserved, &mut f)
+        } else {
+            Some(())
+        };
+        *guard = Some(cursor);
+        result
     }
 }
 
@@ -649,8 +1036,8 @@ impl From<PixelFormat> for Dict {
 /// pixel data is decoded), with the same transformations `image`'s own PNG
 /// decoder uses, so `output_color_type` and row data match what
 /// `image::DynamicImage::from_decoder` would eventually produce.
-fn png_reader(data: Bytes) -> Result<png::Reader<io::Cursor<Bytes>>, png::DecodingError> {
-    let mut decoder = png::Decoder::new(io::Cursor::new(data));
+fn png_reader(data: Bytes) -> Result<png::Reader<PagedSource>, png::DecodingError> {
+    let mut decoder = png::Decoder::new(PagedSource::new(data));
     decoder.set_transformations(png::Transformations::EXPAND);
     decoder.read_info()
 }
@@ -702,8 +1089,9 @@ fn validate_png(
         matches!(color_type, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
     let is_8bit = bit_depth == png::BitDepth::Eight;
 
-    // Stream through (and discard) the rest of the rows to confirm the
-    // whole image decodes without error.
+    // A valid chunk CRC does not prove that the compressed pixel stream is
+    // valid. Validate every row before exposing an infallible lazy decode.
+    // Discarding rows keeps validation memory bounded even for large images.
     while reader.next_row().map_err(png_error_message)?.is_some() {}
 
     Ok((width, height, has_alpha, icc, is_8bit))
@@ -849,6 +1237,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_rgba8_shared_across_concurrent_tiles() {
+        let raster = RasterImage::new(
+            Bytes::new(vec![42; 64 * 64]),
+            RasterFormat::Pixel(PixelFormat {
+                encoding: PixelEncoding::Luma8,
+                width: 64,
+                height: 64,
+            }),
+            Smart::Auto,
+        )
+        .unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        let converted = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        raster.rgba8().clone()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        });
+        for image in &converted {
+            assert!(Arc::ptr_eq(image, &converted[0]));
+            assert_eq!(image.as_rgba8().unwrap().get_pixel(0, 0).0, [42, 42, 42, 255]);
+        }
+
+        let native = RasterImage::new(
+            Bytes::new(vec![42; 64 * 64 * 4]),
+            RasterFormat::Pixel(PixelFormat {
+                encoding: PixelEncoding::Rgba8,
+                width: 64,
+                height: 64,
+            }),
+            Smart::Auto,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(native.rgba8(), native.dynamic()));
+    }
+
+    #[test]
     fn test_image_dpi() {
         #[track_caller]
         fn test(path: &str, format: ExchangeFormat, dpi: f64) {
@@ -900,6 +1330,243 @@ mod tests {
         test("images/small.png"); // palette -> expanded to RGB(A) by EXPAND
     }
 
+    /// A request that rewinds a little -- which is what the resampling
+    /// render path does, since it overlaps consecutive bands by the resize
+    /// filter's kernel support -- must be served from the cursor's retained
+    /// tail and still match the full decode exactly.
+    #[test]
+    fn test_row_range_small_rewind_matches_full_decode() {
+        #[track_caller]
+        fn test(path: &str) {
+            let data = typst_dev_assets::get(path).unwrap();
+            let image =
+                RasterImage::plain(Bytes::new(data), ExchangeFormat::Png).unwrap();
+            let full = image.dynamic().to_rgba8();
+            let (width, height) = (image.width(), image.height());
+            let row = |y: u32| {
+                let start = y as usize * width as usize * 4;
+                &full.as_raw()[start..start + width as usize * 4]
+            };
+
+            // Walk forward in overlapping windows, the way banded rendering
+            // does, then rewind to the very top again.
+            let mut ranges = vec![];
+            let mut y = 0;
+            while y < height {
+                ranges.push((y.saturating_sub(2), (y + 3).min(height)));
+                y += 2;
+            }
+            ranges.push((0, height.min(3)));
+
+            for (y0, y1) in ranges {
+                let region = image.decode_rgba_row_range(y0, y1).unwrap();
+                for y in y0..y1 {
+                    let offset = (y - y0) as usize * width as usize * 4;
+                    assert_eq!(
+                        &region[offset..offset + width as usize * 4],
+                        row(y),
+                        "{path}: row {y} of range {y0}..{y1}"
+                    );
+                }
+            }
+        }
+
+        test("images/chart-good.png");
+        test("images/graph.png");
+    }
+
+    /// Reading an image in the overlapping windows the resampling render
+    /// path uses must reuse one decoder throughout. Each extra start
+    /// re-decompresses the image from row 0, which is what made a banded
+    /// export cost `O(bands * height)` row decodes.
+    #[test]
+    fn test_overlapping_bands_reuse_one_decoder() {
+        let height = 600;
+        let data = encode_png8(8, height);
+        let image = RasterImage::plain(Bytes::new(data), ExchangeFormat::Png).unwrap();
+
+        // Mirrors `try_blit_resized_axis_aligned`: probe the channel count,
+        // then request each band expanded by the filter's kernel support.
+        let band = 64;
+        let margin = 5;
+        let mut y = 0;
+        while y < height {
+            assert!(image.supports_row_range(3));
+            let y0 = y.saturating_sub(margin);
+            let y1 = (y + band + margin).min(height);
+            assert!(image.decode_row_range(y0, y1, 3).is_some());
+            y += band;
+        }
+
+        assert_eq!(
+            image.decoder_starts(),
+            1,
+            "overlapping row ranges must not restart the decoder"
+        );
+    }
+
+    /// The row tiles of one band are rendered concurrently, so they reach
+    /// the row cursor in an arbitrary order. With a window reserved to cover
+    /// the band (see `RasterImage::reserve_retained_rows`) that must still
+    /// cost exactly one decoder start, and each tile must get exactly the
+    /// rows it asked for -- otherwise a tiled band would decode the image
+    /// once per tile instead of once.
+    #[test]
+    fn test_out_of_order_tiles_reuse_one_decoder() {
+        // A size no other test uses: `RasterImage::plain` is memoized on its
+        // bytes, so sharing a fixture would share the decoder-start counter
+        // this test asserts on.
+        let (width, height) = (9_u32, 601_u32);
+        let (band, tile, margin) = (120_u32, 30_u32, 5_u32);
+
+        let image = RasterImage::plain(
+            Bytes::new(encode_png8(width, height)),
+            ExchangeFormat::Png,
+        )
+        .unwrap();
+        image.reserve_retained_rows(band + 2 * margin);
+
+        // `encode_png8` fills the image with `i % 251` in row-major order, so
+        // the expected bytes for a row range are known without decoding
+        // anything -- which keeps this independent of the cursor's state.
+        let stride = (width * 3) as usize;
+        let expected = |y0: u32, y1: u32| -> Vec<u8> {
+            (y0 as usize * stride..y1 as usize * stride)
+                .map(|i| (i % 251) as u8)
+                .collect()
+        };
+
+        for band_y0 in (0..height).step_by(band as usize) {
+            let band_y1 = (band_y0 + band).min(height);
+
+            // Tiles arriving back to front: the worst possible order for a
+            // cursor that can only move forwards.
+            let tiles: Vec<u32> = (band_y0..band_y1).step_by(tile as usize).collect();
+            for &ty in tiles.iter().rev() {
+                let (y0, y1) =
+                    (ty.saturating_sub(margin), (ty + tile + margin).min(height));
+                assert_eq!(
+                    image.decode_row_range(y0, y1, 3).unwrap(),
+                    expected(y0, y1),
+                    "rows {y0}..{y1} are wrong when tiles arrive out of order"
+                );
+            }
+        }
+
+        assert_eq!(
+            image.decoder_starts(),
+            1,
+            "out-of-order tiles inside a reserved window must not restart \
+             the decoder"
+        );
+    }
+
+    /// A rewind further back than the retained tail has to restart the
+    /// decoder, which must be transparent to the caller.
+    #[test]
+    fn test_row_range_long_rewind_matches_full_decode() {
+        let height = RETAIN_MAX_ROWS as u32 * 3;
+        let data = encode_png8(2, height);
+        let image = RasterImage::plain(Bytes::new(data), ExchangeFormat::Png).unwrap();
+        let full = image.dynamic().to_rgba8();
+        let stride = image.width() as usize * 4;
+
+        // Read to the end, so the tail no longer covers the first rows.
+        let all = image.decode_rgba_row_range(0, height).unwrap();
+        assert_eq!(all, full.as_raw()[..stride * height as usize]);
+
+        // Now rewind past the tail; this restarts decompression from row 0.
+        let region = image.decode_rgba_row_range(0, 2).unwrap();
+        assert_eq!(region, &full.as_raw()[..stride * 2]);
+    }
+
+    /// Decoding to three channels must produce exactly the four-channel
+    /// output with the (constant, opaque) alpha byte removed, and must
+    /// refuse a source that has a real alpha channel.
+    #[test]
+    fn test_row_range_three_channels() {
+        let data = typst_dev_assets::get("images/chart-good.png").unwrap();
+        let rgb = RasterImage::plain(Bytes::new(data), ExchangeFormat::Png).unwrap();
+        assert!(!rgb.has_alpha());
+        assert!(rgb.supports_row_range(3));
+
+        let height = rgb.height();
+        let four = rgb.decode_row_range(0, height, 4).unwrap();
+        let three = rgb.decode_row_range(0, height, 3).unwrap();
+        assert_eq!(three.len(), four.len() / 4 * 3);
+        for (rgba, rgb) in four.chunks_exact(4).zip(three.chunks_exact(3)) {
+            assert_eq!(&rgba[..3], rgb);
+            assert_eq!(rgba[3], 255);
+        }
+
+        let data = typst_dev_assets::get("images/graph.png").unwrap();
+        let rgba = RasterImage::plain(Bytes::new(data), ExchangeFormat::Png).unwrap();
+        assert!(rgba.has_alpha());
+        assert!(!rgba.supports_row_range(3));
+        assert!(rgba.decode_row_range(0, 1, 3).is_none());
+    }
+
+    /// Encodes a plain 8-bit RGB PNG of the given size.
+    fn encode_png8(width: u32, height: u32) -> Vec<u8> {
+        let mut data = Vec::with_capacity((width * height * 3) as usize);
+        for i in 0..(width * height * 3) {
+            data.push((i % 251) as u8);
+        }
+
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&data).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn test_large_png_with_valid_crc_but_missing_pixels() {
+        let mut data = encode_png8(1, 1);
+        // Claim a large image while retaining a valid one-pixel zlib stream.
+        data[16..20].copy_from_slice(&4096_u32.to_be_bytes());
+        data[20..24].copy_from_slice(&4096_u32.to_be_bytes());
+        let crc = crc32fast::hash(&data[12..29]);
+        data[29..33].copy_from_slice(&crc.to_be_bytes());
+        assert!(RasterImage::plain(Bytes::new(data), ExchangeFormat::Png).is_err());
+    }
+
+    /// Large images must be fully validated before lazy decoding.
+    #[test]
+    fn test_large_png_validation() {
+        // Exceed the former 32 MiB structural-only validation threshold.
+        let width = 1024;
+        let height = ((32 * 1024 * 1024) / (width as u64 * 3)) as u32 + 8;
+        let data = encode_png8(width, height);
+
+        let image =
+            RasterImage::plain(Bytes::new(data.clone()), ExchangeFormat::Png).unwrap();
+        assert_eq!((image.width(), image.height()), (width, height));
+
+        // Truncated part-way through the pixel data.
+        let truncated = data[..data.len() * 3 / 4].to_vec();
+        let Err(err) = RasterImage::plain(Bytes::new(truncated), ExchangeFormat::Png)
+        else {
+            panic!("truncated file must not load");
+        };
+        assert!(err.contains("failed to decode image"), "{err}");
+
+        // A single flipped bit inside the compressed data.
+        let mut corrupted = data.clone();
+        let middle = corrupted.len() / 2;
+        corrupted[middle] ^= 0xff;
+        let Err(err) = RasterImage::plain(Bytes::new(corrupted), ExchangeFormat::Png)
+        else {
+            panic!("corrupted file must not load");
+        };
+        assert!(err.contains("failed to decode image"), "{err}");
+    }
+
     /// Encodes a small in-memory PNG with varied, non-trivial 16-bit sample
     /// values (not just 0/max), to exercise `sample16_to_8`'s rounding
     /// across its range rather than only its endpoints.
@@ -907,7 +1574,9 @@ mod tests {
         let channels = match color_type {
             png::ColorType::Rgb => 3,
             png::ColorType::Rgba => 4,
-            _ => unreachable!("test only uses Rgb/Rgba"),
+            png::ColorType::Grayscale => 1,
+            png::ColorType::GrayscaleAlpha => 2,
+            png::ColorType::Indexed => unreachable!("test uses direct samples"),
         };
         let mut data = Vec::with_capacity((width * height * channels * 2) as usize);
         for i in 0..(width * height * channels) {
@@ -961,6 +1630,64 @@ mod tests {
 
         test(png::ColorType::Rgb);
         test(png::ColorType::Rgba);
+        test(png::ColorType::Grayscale);
+        test(png::ColorType::GrayscaleAlpha);
+    }
+
+    #[test]
+    fn test_grayscale_row_ranges() {
+        for depth in [
+            png::BitDepth::One,
+            png::BitDepth::Two,
+            png::BitDepth::Four,
+            png::BitDepth::Eight,
+        ] {
+            for alpha in [false, true] {
+                // Low bit depths express transparency with tRNS.
+                let explicit_alpha = alpha && depth == png::BitDepth::Eight;
+                let channels = if explicit_alpha { 2 } else { 1 };
+                let mut encoded = Vec::new();
+                {
+                    let mut encoder = png::Encoder::new(&mut encoded, 8, 5);
+                    encoder.set_depth(depth);
+                    encoder.set_color(if explicit_alpha {
+                        png::ColorType::GrayscaleAlpha
+                    } else {
+                        png::ColorType::Grayscale
+                    });
+                    if alpha && !explicit_alpha {
+                        encoder.set_trns(vec![0, 0]);
+                    }
+                    let mut writer = encoder.write_header().unwrap();
+                    let len = 5 * depth as usize * channels;
+                    let data: Vec<u8> = (0..len).map(|i| (i * 37) as u8).collect();
+                    writer.write_image_data(&data).unwrap();
+                }
+                let image =
+                    RasterImage::plain(Bytes::new(encoded), ExchangeFormat::Png).unwrap();
+                assert!(image.supports_row_range(4));
+                assert_eq!(image.supports_row_range(3), !alpha);
+                // Out-of-order overlapping requests exercise retained raw rows.
+                let ranges = [(2, 5), (1, 4), (0, 5)];
+                let streamed: Vec<_> = ranges
+                    .iter()
+                    .map(|&(y0, y1)| image.decode_rgba_row_range(y0, y1).unwrap())
+                    .collect();
+                assert!(image.0.dynamic.get().is_none());
+                let full = image.dynamic().to_rgba8();
+                for ((y0, y1), rows) in ranges.into_iter().zip(streamed) {
+                    assert_eq!(rows, full.as_raw()[y0 as usize * 32..y1 as usize * 32]);
+                }
+                if alpha {
+                    assert!(image.decode_row_range(0, 5, 3).is_none());
+                } else {
+                    assert_eq!(
+                        image.decode_row_range(0, 5, 3).unwrap(),
+                        image.dynamic().to_rgb8().into_raw()
+                    );
+                }
+            }
+        }
     }
 
     /// Pins the 16-bit-to-8-bit channel rounding formula independent of a
@@ -990,10 +1717,13 @@ mod tests {
         let jpg = RasterImage::plain(Bytes::new(jpg), ExchangeFormat::Jpg).unwrap();
         assert!(jpg.decode_rgba_row_range(0, 1).is_none());
 
-        // Grayscale PNG (not RGB/RGBA even after `EXPAND`).
+        // Grayscale PNGs now stream as well.
         let gray = typst_dev_assets::get("screenshots/3-advanced-paper.png").unwrap();
         let gray = RasterImage::plain(Bytes::new(gray), ExchangeFormat::Png).unwrap();
-        assert!(gray.decode_rgba_row_range(0, 1).is_none());
+        assert_eq!(
+            gray.decode_rgba_row_range(0, 1).unwrap(),
+            gray.dynamic().to_rgba8().as_raw()[..gray.width() as usize * 4]
+        );
 
         // Note: an interlaced-PNG case is intentionally not covered here --
         // the `png` crate's `Writer::write_image_data` doesn't support
